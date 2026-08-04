@@ -586,7 +586,8 @@ const PLANNING_FOV_PIXEL_SIZE_KEY = 'skymap.planningFov.pixelSizeUm';
 const PLANNING_FOV_FOCAL_LENGTH_KEY = 'skymap.planningFov.focalLengthMm';
 const PLANNING_FOV_ROTATION_KEY = 'skymap.planningFov.rotationDeg';
 const VIEW_KEY = 'skymap.view';
-const DEFAULT_FOV_DEG = 10;
+const DEFAULT_FOV_DEG = 180;
+const DEFAULT_TARGET = '24 00 00.00 +59 59 60.0';
 // ASI2600MM Pro (6248x4176, 3.76µm) — just a starting point for the calculator below, not tied
 // to whatever camera is actually connected.
 const DEFAULT_SENSOR_WIDTH_PX = 6248;
@@ -2132,7 +2133,7 @@ export function SkyMapCard({
       const aladin = window.A.aladin(containerRef.current, {
         survey: buildImageSurvey(defaultSurvey),
         fov: savedView?.fovDeg ?? DEFAULT_FOV_DEG,
-        target: savedView ? `${savedView.ra} ${savedView.dec}` : '0 +0',
+        target: savedView ? `${savedView.ra} ${savedView.dec}` : DEFAULT_TARGET,
         cooFrame: 'equatorial',
         projection: readStoredString(PROJECTION_KEY) ?? 'SIN',
         showFullscreenControl: false,
