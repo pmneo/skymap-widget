@@ -2119,6 +2119,13 @@ export function SkyMapCard({
   useEffect(() => {
     if (!window.A || !containerRef.current) return;
     window.A.init.then(() => {
+      // React Strict Mode (dev only) invokes this effect twice on the same mount without an
+      // intervening real unmount — aladinRef survives that (refs, unlike state, aren't reset
+      // between the two invocations), so this guard is what actually stops a second real Aladin
+      // instance from being constructed in the same container. Without it, both instances' custom
+      // HiPS surveys end up manipulating the same underlying wasm-bindgen objects concurrently,
+      // which throws ("recursive use of an object detected") instead of just wasting work.
+      if (aladinRef.current) return;
       const defaultSurvey = surveys[0];
       const savedView = readStoredView();
       const aladin = window.A.aladin(containerRef.current, {
