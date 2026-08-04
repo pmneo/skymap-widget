@@ -391,23 +391,26 @@
 .sky-map {
   position: relative;
   width: 100%;
-  height: 420px;
+  aspect-ratio: 16 / 9;
   border-radius: 6px;
   overflow: hidden;
 }
 
 /* requestFullscreen() is called on the card itself, so :fullscreen scopes to exactly that
  * element — the sky-map div just needs to grow into whatever space the controls above it leave,
- * instead of staying pinned at its normal in-page 420px height. Aladin's own view auto-adapts to
- * its container's size (ResizeObserver-driven), so no extra JS is needed to make it repaint. */
-.card:fullscreen {
+ * instead of staying pinned at its normal in-page 16:9 height. Aladin's own view auto-adapts to
+ * its container's size (ResizeObserver-driven), so no extra JS is needed to make it repaint.
+ * (Selector renamed from the old .card:fullscreen when the root class became sky-map-card — this
+ * had gone stale/dead, which is exactly why fullscreen stopped growing to fill the viewport.) */
+.sky-map-card:fullscreen {
   display: flex;
   flex-direction: column;
   height: 100vh;
 }
 
-.card:fullscreen .sky-map {
+.sky-map-card:fullscreen .sky-map {
   flex: 1;
+  aspect-ratio: auto;
   height: auto;
 }
 

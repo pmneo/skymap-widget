@@ -1598,12 +1598,13 @@ function toDatetimeLocalValue(ms: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-function readStoredBoolean(key: string): boolean {
+function readStoredBoolean(key: string, defaultValue = false): boolean {
   try {
-    return localStorage.getItem(key) === 'true';
+    const raw = localStorage.getItem(key);
+    return raw === null ? defaultValue : raw === 'true';
   }
   catch {
-    return false;
+    return defaultValue;
   }
 }
 
@@ -1835,7 +1836,7 @@ export function SkyMapCard({
   // Ekos IS up, the live `jobs` prop is used directly and this stays null.
   const [diskJobs, setDiskJobs] = useState<SchedulerJob[] | null>(null);
   const targetsCanvasRef = useRef<HTMLCanvasElement>(null);
-  const [showAstrobin, setShowAstrobin] = useState(() => readStoredBoolean(SHOW_ASTROBIN_KEY));
+  const [showAstrobin, setShowAstrobin] = useState(() => readStoredBoolean(SHOW_ASTROBIN_KEY, true));
   const [astrobinFootprints, setAstrobinFootprints] = useState<AstrobinFootprint[] | null>(null);
   // Horizon simulation: the flat 0°-altitude circle plus (if defined) the user's own artificial
   // horizon regions and Terrain panorama, all reprojected for whatever moment horizonTime is —
@@ -3002,13 +3003,17 @@ export function SkyMapCard({
         >
           {isFullscreen ? <CompressIcon /> : <ExpandIcon />}
         </button>
-        <IconToggleButton
-          active={followMount}
-          onToggle={() => setFollowMount((v) => !v)}
-          disabled={!mountCoords}
-          title="Follow mount"
-          icon={<CrosshairIcon />}
-        />
+        {/* Unlike Zenith lock (which can still become available once observatoryInfo loads),
+         * mountCoords/lastImageFilename are either passed by the caller or they structurally never
+         * will be for this deployment — a permanently-disabled button is worse than no button. */}
+        {mountCoords && (
+          <IconToggleButton
+            active={followMount}
+            onToggle={() => setFollowMount((v) => !v)}
+            title="Follow mount"
+            icon={<CrosshairIcon />}
+          />
+        )}
         <IconToggleButton
           active={zenithLock}
           onToggle={() => setZenithLock((v) => !v)}
@@ -3016,13 +3021,14 @@ export function SkyMapCard({
           title="Zenith lock — locks the view to zenith-up (Horizontal mode) instead of celestial-north-up, so the sky's actual drift during a session stays legible"
           icon={<ZenithIcon />}
         />
-        <IconToggleButton
-          active={showLastImage}
-          onToggle={() => setShowLastImage((v) => !v)}
-          disabled={!lastImageFilename}
-          title="Show last image"
-          icon={<LastImageIcon />}
-        />
+        {lastImageFilename && (
+          <IconToggleButton
+            active={showLastImage}
+            onToggle={() => setShowLastImage((v) => !v)}
+            title="Show last image"
+            icon={<LastImageIcon />}
+          />
+        )}
         <IconToggleButton active={showNgc} onToggle={() => setShowNgc((v) => !v)} title="NGC/IC" icon={<GalaxyIcon />} />
         <IconToggleButton active={showSh2} onToggle={() => setShowSh2((v) => !v)} title="Sharpless (Sh2)" icon={<NebulaIcon />} />
         <IconToggleButton active={showGrid} onToggle={() => setShowGrid((v) => !v)} title="Coordinate grid" icon={<GridIcon />} />
