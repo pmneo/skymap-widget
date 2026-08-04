@@ -1,3 +1,45 @@
+/* This package's root container + the CSS custom properties everything below reads (--panel,
+ * --border, --text, --muted, --accent, --danger). Originally these lived only in KStarsCluster's
+ * own global index.css (shared .card/.card--wide dashboard-grid classes + a :root theme) — fine
+ * for that app, but left any *other* consumer's popovers/menus half-unstyled (undefined CSS custom
+ * properties resolve to nothing, not a fallback color) since only this file, not that global CSS,
+ * ships with the package. Defaults are set here so the package looks right standalone; a consuming
+ * app can still override any of them by defining the same custom property further up the DOM
+ * (e.g. its own :root), since inheritance picks the nearest ancestor that sets it. */
+.sky-map-card {
+  --panel: #1c1f28;
+  --border: #2c3040;
+  --text: #e4e7ee;
+  --muted: #8b93a7;
+  --accent: #4dabf7;
+  --danger: #ff6b6b;
+
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  min-width: 0;
+  color: var(--text);
+}
+
+.sky-map-card--wide {
+  grid-column: span 2;
+}
+
+@media (max-width: 640px) {
+  .sky-map-card--wide {
+    grid-column: span 1;
+  }
+}
+
+.sky-map-card h3 {
+  margin: 0 0 12px;
+  font-size: 1rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 .sky-map-controls {
   display: flex;
   align-items: center;

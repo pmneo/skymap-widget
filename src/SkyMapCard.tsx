@@ -2964,7 +2964,7 @@ export function SkyMapCard({
   }, [lastImageFilename]);
 
   return (
-    <div ref={cardRef} className="card card--wide">
+    <div ref={cardRef} className="sky-map-card sky-map-card--wide">
       <h3>Sky Map</h3>
       <div className="sky-map-controls">
         <div className="sky-map-palette-picker" ref={paletteRef}>
