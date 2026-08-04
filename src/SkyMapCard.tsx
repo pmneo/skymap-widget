@@ -468,6 +468,12 @@ interface Props {
   fov?: { widthArcmin: number; heightArcmin: number };
   pa?: number;
   lastImageFilename?: string;
+  /** Whether this deployment's dataSource.getScheduleFileJobs() is backed by a real Ekos/.esl
+   * scheduler at all — defaults to true (KStarsCluster's own case) since that's the only deployment
+   * this existed for originally. A public site with no such backend (astro-homepage's dataSource
+   * always resolves it to []) sets this false so the button doesn't dangle uselessly, same reasoning
+   * as gating "Follow mount"/"Show last image" on mountCoords/lastImageFilename being passed at all. */
+  supportsOpenTargets?: boolean;
 }
 
 /** Four corners of a centerRa/centerDec-centered rectangle, widthDeg x heightDeg, rotated by paDeg
@@ -567,6 +573,9 @@ const SHOW_CONSTELLATION_LINES_KEY = 'skymap.showConstellationLines';
 const SHOW_CONSTELLATION_BOUNDS_KEY = 'skymap.showConstellationBounds';
 const SHOW_OPEN_TARGETS_KEY = 'skymap.showOpenTargets';
 const HORIZON_STEP_INDEX_KEY = 'skymap.horizonStepIndex';
+// Global, not per-deployment/username — this is "where the visitor's browser is", which stays the
+// same regardless of whose gallery they're currently looking at, unlike the real observatory data.
+const MANUAL_LOCATION_KEY = 'skymap.manualLocation';
 // Real width is CSS-defined (see .sky-map-astrobin-popover); the height is only an estimate since
 // the actual rendered height depends on title wrapping and isn't known until after it paints —
 // good enough for clamping the popover to stay on-screen without needing a post-paint measurement.
@@ -1647,6 +1656,19 @@ function readStoredNumber(key: string, fallback: number): number {
   }
 }
 
+function readStoredManualLocation(): { latitude: number; longitude: number } | null {
+  const raw = readStoredString(MANUAL_LOCATION_KEY);
+  if (!raw) return null;
+  const [latStr, lonStr] = raw.split(',');
+  const latitude = Number(latStr);
+  const longitude = Number(lonStr);
+  return Number.isFinite(latitude) && Number.isFinite(longitude) ? { latitude, longitude } : null;
+}
+
+function writeStoredManualLocation(location: { latitude: number; longitude: number }) {
+  writeStoredString(MANUAL_LOCATION_KEY, `${location.latitude},${location.longitude}`);
+}
+
 function writeStoredNumber(key: string, value: number) {
   try {
     localStorage.setItem(key, String(value));
@@ -1756,6 +1778,7 @@ function drawOpenTargets(
 
 export function SkyMapCard({
   dataSource, mountCoords, activeJob, jobs, ekosReady, fov, pa, lastImageFilename,
+  supportsOpenTargets = true,
 }: Props) {
   // Static for the component's lifetime (a deployment's palette list doesn't change at runtime),
   // so this is called once here rather than re-invoked at each of its few call sites below.
@@ -1852,10 +1875,22 @@ export function SkyMapCard({
     return stored >= 0 && stored < HORIZON_STEPS.length ? stored : 2;
   });
   const [observatoryInfo, setObservatoryInfo] = useState<ObservatoryInfo | null>(null);
+  // A visitor-supplied fallback (typed in, or read from navigator.geolocation) for deployments
+  // whose dataSource has no real location to give (see the "Set your location" prompt below) —
+  // this is about the *visitor's* browser, not the account being viewed, so it isn't reset per
+  // dataSource/username the way observatoryInfo itself is; it starts from whatever was last saved.
+  const [manualLocation, setManualLocation] = useState<{ latitude: number; longitude: number } | null>(
+    () => readStoredManualLocation(),
+  );
+  const effectiveObservatoryInfo = useMemo<ObservatoryInfo | null>(() => {
+    if (!observatoryInfo) return null;
+    if (isValidLocation(observatoryInfo) || !manualLocation) return observatoryInfo;
+    return { ...observatoryInfo, latitude: manualLocation.latitude, longitude: manualLocation.longitude };
+  }, [observatoryInfo, manualLocation]);
   // Kept live for the poll-loop effect below (whose closure only runs once, deps [ready]) to read
   // without needing to be in that effect's own dependency array.
   horizonTimeRef.current = horizonTime;
-  observatoryInfoRef.current = observatoryInfo;
+  observatoryInfoRef.current = effectiveObservatoryInfo;
   const [artificialHorizon, setArtificialHorizon] = useState<ArtificialHorizonRegion[]>([]);
   const [terrainImageLoaded, setTerrainImageLoaded] = useState(false);
   const observatoryFetchedRef = useRef(false);
@@ -1908,21 +1943,56 @@ export function SkyMapCard({
   const planningFovLockedCenterRef = useRef<{ ra: number; dec: number } | null>(null);
   const [sensorConfigOpen, setSensorConfigOpen] = useState(false);
   const sensorConfigRef = useRef<HTMLDivElement>(null);
+  const [locationPopoverOpen, setLocationPopoverOpen] = useState(false);
+  const locationPopoverRef = useRef<HTMLDivElement>(null);
+  const [manualLatDraft, setManualLatDraft] = useState(() => manualLocation?.latitude ?? 0);
+  const [manualLonDraft, setManualLonDraft] = useState(() => manualLocation?.longitude ?? 0);
+  const [geolocating, setGeolocating] = useState(false);
+  const [geolocationError, setGeolocationError] = useState<string | null>(null);
+
+  function applyManualLocation(latitude: number, longitude: number) {
+    const location = { latitude, longitude };
+    setManualLocation(location);
+    writeStoredManualLocation(location);
+    setGeolocationError(null);
+  }
+
+  function useBrowserGeolocation() {
+    if (!navigator.geolocation) {
+      setGeolocationError("Your browser doesn't support geolocation");
+      return;
+    }
+    setGeolocating(true);
+    setGeolocationError(null);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setGeolocating(false);
+        setManualLatDraft(pos.coords.latitude);
+        setManualLonDraft(pos.coords.longitude);
+        applyManualLocation(pos.coords.latitude, pos.coords.longitude);
+      },
+      (err) => {
+        setGeolocating(false);
+        setGeolocationError(err.code === err.PERMISSION_DENIED ? 'Location permission denied' : 'Could not determine your location');
+      },
+      { timeout: 10000 },
+    );
+  }
   const planningFovWidthArcmin = sensorFovArcmin(sensorWidthPx, pixelSizeUm, focalLengthMm);
   const planningFovHeightArcmin = sensorFovArcmin(sensorHeightPx, pixelSizeUm, focalLengthMm);
   // Recomputed only when the (already debounced) target center, the simulated time, or the
   // location/artificial-horizon data actually change — 360 altitude samples is cheap once, not
   // something worth redoing on every unrelated re-render.
   const planningFovVisibility = useMemo(() => {
-    if (!planningFovEnabled || !planningFovCenter || !observatoryInfo || !isValidLocation(observatoryInfo)) {
+    if (!planningFovEnabled || !planningFovCenter || !effectiveObservatoryInfo || !isValidLocation(effectiveObservatoryInfo)) {
       return null;
     }
     const samples = sampleVisibility(
       planningFovCenter.ra, planningFovCenter.dec,
-      observatoryInfo.latitude, observatoryInfo.longitude, horizonTime, artificialHorizon,
+      effectiveObservatoryInfo.latitude, effectiveObservatoryInfo.longitude, horizonTime, artificialHorizon,
     );
     return { samples, window: findVisibilityWindow(samples, horizonTime) };
-  }, [planningFovEnabled, planningFovCenter, observatoryInfo, artificialHorizon, horizonTime]);
+  }, [planningFovEnabled, planningFovCenter, effectiveObservatoryInfo, artificialHorizon, horizonTime]);
   // On-demand (not re-queried on every pan/zoom, unlike the FOV rectangles) — a SIMBAD conesearch
   // is a real network round-trip, and "what's in this exact framing" is naturally a "I've settled
   // on a spot, now check it" action rather than something to hammer continuously while dragging.
@@ -2011,6 +2081,25 @@ export function SkyMapCard({
       window.removeEventListener('keydown', onKeyDown);
     };
   }, [sensorConfigOpen]);
+
+  // Same outside-click/Escape pattern, for the "Set your location" popover below.
+  useEffect(() => {
+    if (!locationPopoverOpen) return undefined;
+    function onPointerDown(e: PointerEvent) {
+      if (locationPopoverRef.current && !locationPopoverRef.current.contains(e.target as Node)) {
+        setLocationPopoverOpen(false);
+      }
+    }
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') setLocationPopoverOpen(false);
+    }
+    document.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [locationPopoverOpen]);
 
   // Same outside-click/Escape pattern as sensorConfigOpen above, for the survey/palette picker's
   // own popup (see its own button below — replaces what used to be a plain <select>).
@@ -2291,8 +2380,8 @@ export function SkyMapCard({
         if (hctx) {
           hctx.setTransform(dpr, 0, 0, dpr, 0, 0);
           window.clearTimeout(horizonRetryRef.current);
-          if (showHorizon && observatoryInfo && isValidLocation(observatoryInfo)) {
-            const info = observatoryInfo;
+          if (showHorizon && effectiveObservatoryInfo && isValidLocation(effectiveObservatoryInfo)) {
+            const info = effectiveObservatoryInfo;
             // Same transient-WebGL-exception hazard as the terrain overlay (see its own retry
             // comment above) can leave world2pix returning null for most/all of this loop's points
             // right after a zoom/pan brings fresh HiPS tiles in — without a retry, that one bad
@@ -2378,9 +2467,9 @@ export function SkyMapCard({
         const tctx = terrainCanvas.getContext('2d');
         if (tctx) {
           tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-          if (showHorizon && showTerrain && terrainImageLoaded && terrainPixelDataRef.current && observatoryInfo && isValidLocation(observatoryInfo)) {
+          if (showHorizon && showTerrain && terrainImageLoaded && terrainPixelDataRef.current && effectiveObservatoryInfo && isValidLocation(effectiveObservatoryInfo)) {
             const src = terrainPixelDataRef.current;
-            const info = observatoryInfo;
+            const info = effectiveObservatoryInfo;
 
             // redraw() (and this whole effect) reruns on plenty of things that have nothing to do
             // with the terrain view — mountCoords.ra/dec updates every couple hundred ms while the
@@ -2486,7 +2575,7 @@ export function SkyMapCard({
     mountCoords?.ra, mountCoords?.dec, fov?.widthArcmin, fov?.heightArcmin, pa, showLastImage, lastImageFilename,
     showAstrobin, astrobinFootprints, hiddenAstrobinUrls, astrobinPopover,
     planningFovEnabled, planningFovWidthArcmin, planningFovHeightArcmin, planningFovRotationDeg,
-    showHorizon, showTerrain, horizonTime, observatoryInfo, artificialHorizon, terrainImageLoaded,
+    showHorizon, showTerrain, horizonTime, effectiveObservatoryInfo, artificialHorizon, terrainImageLoaded,
     openTargetJobs,
   ]);
 
@@ -3018,7 +3107,7 @@ export function SkyMapCard({
         <IconToggleButton
           active={zenithLock}
           onToggle={() => setZenithLock((v) => !v)}
-          disabled={!observatoryInfo || !isValidLocation(observatoryInfo)}
+          disabled={!effectiveObservatoryInfo || !isValidLocation(effectiveObservatoryInfo)}
           title="Zenith lock — locks the view to zenith-up (Horizontal mode) instead of celestial-north-up, so the sky's actual drift during a session stays legible"
           icon={<ZenithIcon />}
         />
@@ -3046,12 +3135,14 @@ export function SkyMapCard({
           icon={<ConstellationBoundsIcon />}
         />
         <IconToggleButton active={showAstrobin} onToggle={() => setShowAstrobin((v) => !v)} title="My AstroBin" icon={<GalleryIcon />} />
-        <IconToggleButton
-          active={showOpenTargets}
-          onToggle={() => setShowOpenTargets((v) => !v)}
-          title={ekosReady ? 'Open targets — from the running Ekos scheduler' : 'Open targets — from the configured sequence file'}
-          icon={<OpenTargetsIcon />}
-        />
+        {supportsOpenTargets && (
+          <IconToggleButton
+            active={showOpenTargets}
+            onToggle={() => setShowOpenTargets((v) => !v)}
+            title={ekosReady ? 'Open targets — from the running Ekos scheduler' : 'Open targets — from the configured sequence file'}
+            icon={<OpenTargetsIcon />}
+          />
+        )}
         <IconToggleButton
           active={planningFovEnabled}
           onToggle={() => setPlanningFovEnabled((v) => !v)}
@@ -3125,7 +3216,7 @@ export function SkyMapCard({
             {' '}({(planningFovWidthArcmin / 60).toFixed(2)}° × {(planningFovHeightArcmin / 60).toFixed(2)}°)
           </span>
           <div className="sky-map-fov-results-anchor" ref={fovResultsRef}>
-            <button type="button" onClick={searchFovObjects} disabled={fovObjectsLoading}>
+            <button type="button" className="sky-map-button" onClick={searchFovObjects} disabled={fovObjectsLoading}>
               {fovObjectsLoading ? 'Searching…' : 'Find objects in FOV'}
             </button>
             {fovResultsOpen && (
@@ -3161,8 +3252,8 @@ export function SkyMapCard({
               </div>
             )}
           </div>
-          {planningFovCenter && (!observatoryInfo || !isValidLocation(observatoryInfo)) && (
-            <span className="sky-map-horizon-warning">No location configured in KStars — can't compute visibility</span>
+          {planningFovCenter && (!effectiveObservatoryInfo || !isValidLocation(effectiveObservatoryInfo)) && (
+            <span className="sky-map-horizon-warning">No location set — can&apos;t compute visibility (set one in the Horizon panel)</span>
           )}
           {planningFovVisibility && (
             <div className="sky-map-visibility">
@@ -3219,7 +3310,7 @@ export function SkyMapCard({
               +
             </button>
           </div>
-          <button type="button" onClick={() => setHorizonTime(Date.now())}>Now</button>
+          <button type="button" className="sky-map-button" onClick={() => setHorizonTime(Date.now())}>Now</button>
           {observatoryInfo?.hasTerrain && (
             <IconToggleButton
               active={showTerrain}
@@ -3228,8 +3319,54 @@ export function SkyMapCard({
               icon={<TerrainIcon />}
             />
           )}
+          {/* Only when the dataSource itself has no real location to give — once that's true, a
+           * visitor-supplied location (typed or geolocated) is the only way horizon/zenith-lock/
+           * visibility become available at all, so this stays visible (as a compact readout +
+           * "Change") even after manualLocation is set, rather than disappearing silently. */}
           {observatoryInfo && !isValidLocation(observatoryInfo) && (
-            <span className="sky-map-horizon-warning">No location configured in KStars</span>
+            <div className="sky-map-location-prompt" ref={locationPopoverRef}>
+              {manualLocation ? (
+                <span className="sky-map-horizon-note">
+                  Using your location ({manualLocation.latitude.toFixed(2)}°, {manualLocation.longitude.toFixed(2)}°)
+                </span>
+              ) : (
+                <span className="sky-map-horizon-warning">No location set</span>
+              )}
+              <button type="button" className="sky-map-button" onClick={() => setLocationPopoverOpen((open) => !open)}>
+                {manualLocation ? 'Change' : 'Set location'}
+              </button>
+              {locationPopoverOpen && (
+                <div className="sky-map-location-popup">
+                  <button type="button" className="sky-map-button" onClick={useBrowserGeolocation} disabled={geolocating}>
+                    {geolocating ? 'Locating…' : 'Use my location'}
+                  </button>
+                  <label>
+                    Latitude
+                    <input
+                      type="number" min={-90} max={90} step={0.0001} value={manualLatDraft}
+                      onChange={(e) => setManualLatDraft(Number(e.target.value))}
+                    />
+                    °
+                  </label>
+                  <label>
+                    Longitude
+                    <input
+                      type="number" min={-180} max={180} step={0.0001} value={manualLonDraft}
+                      onChange={(e) => setManualLonDraft(Number(e.target.value))}
+                    />
+                    °
+                  </label>
+                  <button
+                    type="button"
+                    className="sky-map-button"
+                    onClick={() => { applyManualLocation(manualLatDraft, manualLonDraft); setLocationPopoverOpen(false); }}
+                  >
+                    Set
+                  </button>
+                  {geolocationError && <span className="sky-map-horizon-warning">{geolocationError}</span>}
+                </div>
+              )}
+            </div>
           )}
           {artificialHorizon.length > 0 && (
             <span className="sky-map-horizon-note">
@@ -3269,7 +3406,7 @@ export function SkyMapCard({
             </div>
             <div className="sky-map-astrobin-popover-actions">
               <a href={astrobinPopover.footprint.url} target="_blank" rel="noreferrer">Open on AstroBin</a>
-              <button type="button" onClick={() => toggleAstrobinHidden(astrobinPopover.footprint.url)}>
+              <button type="button" className="sky-map-button" onClick={() => toggleAstrobinHidden(astrobinPopover.footprint.url)}>
                 {hiddenAstrobinUrls.has(astrobinPopover.footprint.url) ? 'Show' : 'Hide'}
               </button>
             </div>
