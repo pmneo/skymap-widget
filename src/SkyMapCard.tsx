@@ -1221,9 +1221,12 @@ function drawOneAstrobinFootprint(
   // — reordering the corners array by two positions before interpolating is equivalent to that same
   // 180° correction, just expressed as a relabeling instead of an extra rotation.
   const meshCorners = f.corners ?? (([a, b, c, d]) => [c, d, a, b])(footprintCorners(f));
-  const rawMesh = imageReady
-    ? computeFootprintMesh(aladin, meshCorners, ASTROBIN_MESH_GRID_SIZE)
-    : null;
+  // Computed regardless of imageReady: the mesh is just the sky-curvature geometry, no image
+  // pixels involved (drawMeshOutline traces it, drawImageMesh separately textures it) — gating it
+  // on imageReady meant the outline shown while a thumbnail is still loading was a plain
+  // straight-sided rect instead of the true (slightly curved) shape, purely because texturing and
+  // outlining used to be bundled behind the same condition.
+  const rawMesh = computeFootprintMesh(aladin, meshCorners, ASTROBIN_MESH_GRID_SIZE);
   // A mesh whose points collectively sprawl across most of the canvas is just as broken as one
   // with a single oversized cell (see meshBoundingSpan's own comment) — discard the whole thing
   // rather than let drawImageMesh paint every individual (locally-small) cell of a row that's
@@ -1234,7 +1237,7 @@ function drawOneAstrobinFootprint(
     if (spanX > maxSpanPx || spanY > maxSpanPx) mesh = null;
   }
   if (mesh) {
-    drawImageMesh(ctx, img, mesh, ASTROBIN_MESH_GRID_SIZE, maxSpanPx);
+    if (imageReady) drawImageMesh(ctx, img, mesh, ASTROBIN_MESH_GRID_SIZE, maxSpanPx);
     drawMeshOutline(ctx, mesh, ASTROBIN_MESH_GRID_SIZE);
   } else if (w <= maxSpanPx && h <= maxSpanPx) {
     ctx.save();
