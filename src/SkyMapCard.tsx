@@ -3,6 +3,7 @@ import { getJobStateLabel, type SchedulerJob } from './scheduler';
 import { imageUrl, fetchAutoStretch, DEFAULT_STRETCH, type StretchSettings } from './imageApi';
 import { altAzToRaDec, raDecToAltAz, getLocalSiderealTime } from './coordinates';
 import { isValidLocation } from './horizonApi';
+import { createConcurrencyLimiter } from './concurrencyLimit';
 import type { SkyMapDataSource } from './dataSource';
 import type {
   ObservatoryInfo, ArtificialHorizonRegion, AstrobinFootprint, SurveyOption,
@@ -897,19 +898,48 @@ function hitTestAstrobinFootprint(x: number, y: number, rects: AstrobinHitRect[]
   return null;
 }
 
+// Shared by every getAstrobinImage call below (module-level, not per-render) — a gallery with a
+// few dozen simultaneously-visible footprints (see drawAstrobinFootprints' own comment) used to
+// fire one `new Image().src = url` per footprint at once, easily blowing past the browser's
+// 6-connections-per-origin limit on its own.
+const astrobinThumbnailLimiter = createConcurrencyLimiter(3);
+
 /** Loaded once per hash and reused across redraws/frames — plain Image objects rather than DOM
- * <img> elements, since these are only ever drawImage()'d onto the canvas, never inserted. No
- * crossOrigin needed either: nothing here reads pixels back (no getImageData/toDataURL), so
- * there's no canvas-tainting concern, and requesting one would just risk an extra failed preflight
- * against AstroBin's CDN. */
-function getAstrobinImage(cache: Map<string, HTMLImageElement>, f: AstrobinFootprint, onLoad: () => void): HTMLImageElement {
+ * <img> elements, since these are only ever drawImage()'d onto the canvas, never inserted. Fetched
+ * (through the limiter above) rather than assigned straight to img.src, and handed a blob: URL
+ * once ready: this requires thumbnailUrl to be a same-origin (or at least CORS-permissive) URL —
+ * both this package's consumers proxy it through their own backend rather than linking straight to
+ * AstroBin's CDN, see astro-homepage's /api/image-cache and KStarsCluster's own
+ * AstrobinProxyServlet#serveThumbnail. onSettled fires (and triggers a redraw) whether the load
+ * succeeded or failed, so a broken thumbnail can't leave the loading gate stuck open forever. */
+function getAstrobinImage(
+  cache: Map<string, HTMLImageElement>,
+  f: AstrobinFootprint,
+  onLoadStart: (hash: string) => void,
+  onSettled: (hash: string) => void,
+): HTMLImageElement {
   let img = cache.get(f.hash);
-  if (!img) {
-    img = new Image();
-    img.onload = onLoad;
-    img.src = f.thumbnailUrl;
-    cache.set(f.hash, img);
-  }
+  if (img) return img;
+
+  img = new Image();
+  cache.set(f.hash, img);
+  onLoadStart(f.hash);
+  const settle = () => onSettled(f.hash);
+
+  astrobinThumbnailLimiter(() =>
+    fetch(f.thumbnailUrl).then((res) => {
+      if (!res.ok) throw new Error(`thumbnail fetch failed: ${res.status}`);
+      return res.blob();
+    }),
+  )
+    .then((blob) => {
+      const url = URL.createObjectURL(blob);
+      img!.onload = settle;
+      img!.onerror = settle;
+      img!.src = url;
+    })
+    .catch(settle);
+
   return img;
 }
 
@@ -1091,9 +1121,14 @@ function drawOneAstrobinFootprint(
   hidden: boolean,
   isSelected: boolean,
   imagesCache: Map<string, HTMLImageElement>,
-  onImageLoad: () => void,
+  onLoadStart: (hash: string) => void,
+  onSettled: (hash: string) => void,
   containerW: number,
   containerH: number,
+  // False while any footprint thumbnail in the current batch is still loading — see
+  // pendingAstrobinImages below. Keeps every image in a redraw pass appearing together instead of
+  // popping in one at a time as each fetch happens to finish.
+  canShowImages: boolean,
 ) {
   const { cx, cy, w, h, angleRad } = rect;
   if (hidden) {
@@ -1110,7 +1145,8 @@ function drawOneAstrobinFootprint(
     ctx.restore();
     return;
   }
-  const img = getAstrobinImage(imagesCache, f, onImageLoad);
+  const img = getAstrobinImage(imagesCache, f, onLoadStart, onSettled);
+  const imageReady = canShowImages && img.complete && img.naturalWidth > 0;
   // opacity applies to the image AND its outline together, matching the old CSS behavior of
   // opacity on the whole footprint element.
   ctx.globalAlpha = isSelected ? 1 : 0.8;
@@ -1124,7 +1160,7 @@ function drawOneAstrobinFootprint(
   // — reordering the corners array by two positions before interpolating is equivalent to that same
   // 180° correction, just expressed as a relabeling instead of an extra rotation.
   const meshCorners = f.corners ?? (([a, b, c, d]) => [c, d, a, b])(footprintCorners(f));
-  const mesh = img.complete && img.naturalWidth > 0
+  const mesh = imageReady
     ? computeFootprintMesh(aladin, meshCorners, ASTROBIN_MESH_GRID_SIZE)
     : null;
   if (mesh) {
@@ -1135,7 +1171,7 @@ function drawOneAstrobinFootprint(
     ctx.save();
     ctx.translate(cx, cy);
     ctx.rotate(angleRad);
-    if (img.complete && img.naturalWidth > 0) {
+    if (imageReady) {
       ctx.drawImage(img, -w / 2, -h / 2, w, h);
     }
     ctx.strokeRect(-w / 2, -h / 2, w, h);
@@ -1160,9 +1196,11 @@ function drawAstrobinFootprints(
   hiddenUrls: Set<string>,
   selectedUrl: string | null,
   imagesCache: Map<string, HTMLImageElement>,
-  onImageLoad: () => void,
+  onLoadStart: (hash: string) => void,
+  onSettled: (hash: string) => void,
   containerW: number,
   containerH: number,
+  canShowImages: boolean,
 ): AstrobinHitRect[] {
   const rects: AstrobinHitRect[] = [];
   let selectedEntry: { footprint: AstrobinFootprint; rect: ScreenRect } | null = null;
@@ -1210,10 +1248,10 @@ function drawAstrobinFootprints(
       selectedEntry = { footprint, rect };
       continue;
     }
-    drawOneAstrobinFootprint(ctx, aladin, footprint, rect, hidden, false, imagesCache, onImageLoad, containerW, containerH);
+    drawOneAstrobinFootprint(ctx, aladin, footprint, rect, hidden, false, imagesCache, onLoadStart, onSettled, containerW, containerH, canShowImages);
   }
   if (selectedEntry) {
-    drawOneAstrobinFootprint(ctx, aladin, selectedEntry.footprint, selectedEntry.rect, false, true, imagesCache, onImageLoad, containerW, containerH);
+    drawOneAstrobinFootprint(ctx, aladin, selectedEntry.footprint, selectedEntry.rect, false, true, imagesCache, onLoadStart, onSettled, containerW, containerH, canShowImages);
   }
   return rects;
 }
@@ -1807,6 +1845,16 @@ export function SkyMapCard({
   // touches no layout at all.
   const astrobinCanvasRef = useRef<HTMLCanvasElement>(null);
   const astrobinImagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  // Which footprint thumbnails are currently mid-fetch, by hash — a Set rather than a plain
+  // counter so a stray duplicate start/settle call can't drift it out of sync. Non-empty means
+  // drawOneAstrobinFootprint holds off on drawing *any* thumbnail this redraw (see canShowImages),
+  // so a batch of newly-visible footprints reveals together once they're all ready instead of
+  // popping in one at a time as each fetch happens to finish.
+  const pendingAstrobinHashesRef = useRef<Set<string>>(new Set());
+  const [pendingAstrobinCount, setPendingAstrobinCount] = useState(0);
+  // Flips true (forever) the first time the pending set empties out — see canShowAstrobinImages
+  // at the redraw call site below for why the "wait for the whole batch" gate only applies once.
+  const hasRevealedAstrobinImagesRef = useRef(false);
   // Recomputed every redraw() call — consumed by the click handler below for hit testing, since a
   // canvas has no DOM nodes of its own to hang a click listener off.
   const astrobinHitRectsRef = useRef<AstrobinHitRect[]>([]);
@@ -2423,10 +2471,29 @@ export function SkyMapCard({
         if (ctx) {
           ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
           ctx.clearRect(0, 0, container.clientWidth, container.clientHeight);
+          // Only gates the *first* batch of thumbnails a session ever loads (see
+          // hasRevealedAstrobinImagesRef) — once that's revealed, later footprints panned into
+          // view show progressively as they load same as before; permanently withholding
+          // already-loaded thumbnails every time a newly-panned-in footprint starts fetching would
+          // make already-visible images flicker out and back during ordinary panning.
+          const canShowAstrobinImages = hasRevealedAstrobinImagesRef.current || pendingAstrobinHashesRef.current.size === 0;
           astrobinHitRectsRef.current = showAstrobin && astrobinFootprints
             ? drawAstrobinFootprints(
               ctx, aladin, astrobinFootprints, hiddenAstrobinUrls, astrobinPopover?.footprint.url ?? null,
-              astrobinImagesRef.current, () => redrawRef.current(), container.clientWidth, container.clientHeight,
+              astrobinImagesRef.current,
+              (hash) => {
+                if (pendingAstrobinHashesRef.current.has(hash)) return;
+                pendingAstrobinHashesRef.current.add(hash);
+                setPendingAstrobinCount(pendingAstrobinHashesRef.current.size);
+              },
+              (hash) => {
+                pendingAstrobinHashesRef.current.delete(hash);
+                if (pendingAstrobinHashesRef.current.size === 0) hasRevealedAstrobinImagesRef.current = true;
+                setPendingAstrobinCount(pendingAstrobinHashesRef.current.size);
+                redrawRef.current();
+              },
+              container.clientWidth, container.clientHeight,
+              canShowAstrobinImages,
             )
             : [];
         }
@@ -3380,6 +3447,11 @@ export function SkyMapCard({
         className="sky-map"
         onClick={handleAstrobinClick}
       >
+        {showAstrobin && pendingAstrobinCount > 0 && (
+          <div className="sky-map-astrobin-loading" aria-hidden>
+            <div className="sky-map-astrobin-loading-bar" />
+          </div>
+        )}
         {lastImageFilename && (
           <img
             ref={overlayImgRef}

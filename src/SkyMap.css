@@ -459,6 +459,30 @@
   overflow: hidden;
 }
 
+.sky-map-astrobin-loading {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  z-index: 5;
+  overflow: hidden;
+  background: rgba(15, 17, 26, 0.6);
+}
+
+.sky-map-astrobin-loading-bar {
+  height: 100%;
+  width: 30%;
+  border-radius: 999px;
+  background: var(--accent);
+  animation: sky-map-loading-slide 1.1s ease-in-out infinite;
+}
+
+@keyframes sky-map-loading-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(333%); }
+}
+
 /* requestFullscreen() is called on the card itself, so :fullscreen scopes to exactly that
  * element — the sky-map div just needs to grow into whatever space the controls above it leave,
  * instead of staying pinned at its normal in-page 16:9 height. Aladin's own view auto-adapts to
