@@ -812,6 +812,22 @@ function footprintCenterAndRadiusDeg(f: AstrobinFootprint): { ra: number; dec: n
   };
 }
 
+/** Independent, non-world2pix estimate of how large (in screen px) a footprint's own real angular
+ * size should project to under the view's current FOV — pure spherical trig plus the container's
+ * pixels-per-degree scale. Deliberately NOT derived from any world2pix call (unlike rect.w/h or a
+ * mesh's own bounding span): confirmed live (RA 13h45m26.97s, DEC -63°43'47.4" under MOL) that both
+ * of those can *already* be corrupted by the exact same projection breakdown this is meant to
+ * catch — rect.h alone was 2.9x the container's own height there, so using it as the "how big
+ * should this actually be" baseline would have meant trusting the very thing that's broken. */
+function expectedFootprintDiagonalPx(f: AstrobinFootprint, aladin: any, containerW: number, containerH: number): number {
+  const { radiusDeg } = footprintCenterAndRadiusDeg(f);
+  const [fovX, fovY] = aladin.getFov();
+  const fovDiagDeg = Math.hypot(fovX, fovY);
+  if (!(fovDiagDeg > 0)) return Math.max(containerW, containerH);
+  const pxPerDeg = Math.hypot(containerW, containerH) / fovDiagDeg;
+  return radiusDeg * 2 * pxPerDeg;
+}
+
 /** Shoelace formula on the footprint's own corners, treating RA/Dec as planar — inaccurate as a
  * real deg² figure (no cos(dec) scaling, breaks near the RA=0/360 wrap) but every image in this
  * gallery is a few degrees across at most, so it's more than good enough to rank "which of these
@@ -904,27 +920,34 @@ function hitTestAstrobinFootprint(x: number, y: number, rects: AstrobinHitRect[]
 // 6-connections-per-origin limit on its own.
 const astrobinThumbnailLimiter = createConcurrencyLimiter(3);
 
-/** Loaded once per hash and reused across redraws/frames — plain Image objects rather than DOM
- * <img> elements, since these are only ever drawImage()'d onto the canvas, never inserted. Fetched
- * (through the limiter above) rather than assigned straight to img.src, and handed a blob: URL
- * once ready: this requires thumbnailUrl to be a same-origin (or at least CORS-permissive) URL —
- * both this package's consumers proxy it through their own backend rather than linking straight to
- * AstroBin's CDN, see astro-homepage's /api/image-cache and KStarsCluster's own
+/** Loaded once per thumbnailUrl and reused across redraws/frames — plain Image objects rather than
+ * DOM <img> elements, since these are only ever drawImage()'d onto the canvas, never inserted.
+ * Keyed by thumbnailUrl rather than hash: despite AstrobinFootprintBase's type saying hash is a
+ * plain string, real API responses send `hash: null` for a real share of images (confirmed on a
+ * live gallery: 66 of 238 footprints, all with distinct thumbnails) — every one of those collapsed
+ * into the *same* Map entry keyed by the literal string "null", so whichever of those 66 images
+ * happened to load first got drawn for all the others too, and which one won that race varied
+ * between loads. thumbnailUrl has no such problem (confirmed unique across the same gallery).
+ * Fetched (through the limiter above) rather than assigned straight to img.src, and handed a blob:
+ * URL once ready: this requires thumbnailUrl to be a same-origin (or at least CORS-permissive)
+ * URL — both this package's consumers proxy it through their own backend rather than linking
+ * straight to AstroBin's CDN, see astro-homepage's /api/image-cache and KStarsCluster's own
  * AstrobinProxyServlet#serveThumbnail. onSettled fires (and triggers a redraw) whether the load
  * succeeded or failed, so a broken thumbnail can't leave the loading gate stuck open forever. */
 function getAstrobinImage(
   cache: Map<string, HTMLImageElement>,
   f: AstrobinFootprint,
-  onLoadStart: (hash: string) => void,
-  onSettled: (hash: string) => void,
+  onLoadStart: (key: string) => void,
+  onSettled: (key: string) => void,
 ): HTMLImageElement {
-  let img = cache.get(f.hash);
+  const key = f.thumbnailUrl;
+  let img = cache.get(key);
   if (img) return img;
 
   img = new Image();
-  cache.set(f.hash, img);
-  onLoadStart(f.hash);
-  const settle = () => onSettled(f.hash);
+  cache.set(key, img);
+  onLoadStart(key);
+  const settle = () => onSettled(key);
 
   astrobinThumbnailLimiter(() =>
     fetch(f.thumbnailUrl).then((res) => {
@@ -1016,6 +1039,31 @@ function computeFootprintMesh(
     mesh.push(row);
   }
   return mesh;
+}
+
+/** Widest horizontal/vertical spread across every projected point in the mesh (nulls skipped).
+ * drawImageMesh's own per-cell maxSpanPx guard only catches a *sudden* jump between two adjacent
+ * grid points — it does nothing for a distortion that instead drifts a little at a time, cell by
+ * cell, across an entire row (confirmed under MOL near a different pole-adjacent declination than
+ * the single-corner-jump case: every individual cell stayed under the per-cell threshold, yet the
+ * row's points crept all the way from one edge of the canvas to the other, painting a thin sliver
+ * stretched across nearly the full width). Checking the mesh's overall bounding box catches that
+ * case too — a real small footprint's projected mesh never approaches canvas-sized extent even
+ * under heavy curvature, so a mesh that does is symptomatic of the same underlying projection
+ * breakdown regardless of whether it shows up as one big jump or many small ones. */
+function meshBoundingSpan(mesh: ([number, number] | null)[][], gridSize: number): { spanX: number; spanY: number } {
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (let j = 0; j <= gridSize; j++) {
+    for (let i = 0; i <= gridSize; i++) {
+      const p = mesh[j][i];
+      if (!p) continue;
+      if (p[0] < minX) minX = p[0];
+      if (p[0] > maxX) maxX = p[0];
+      if (p[1] < minY) minY = p[1];
+      if (p[1] > maxY) maxY = p[1];
+    }
+  }
+  return { spanX: maxX - minX, spanY: maxY - minY };
 }
 
 /** The unique affine transform mapping source triangle (sx0,sy0)/(sx1,sy1)/(sx2,sy2) onto
@@ -1121,8 +1169,8 @@ function drawOneAstrobinFootprint(
   hidden: boolean,
   isSelected: boolean,
   imagesCache: Map<string, HTMLImageElement>,
-  onLoadStart: (hash: string) => void,
-  onSettled: (hash: string) => void,
+  onLoadStart: (key: string) => void,
+  onSettled: (key: string) => void,
   containerW: number,
   containerH: number,
   // False while any footprint thumbnail in the current batch is still loading — see
@@ -1131,7 +1179,20 @@ function drawOneAstrobinFootprint(
   canShowImages: boolean,
 ) {
   const { cx, cy, w, h, angleRad } = rect;
+  // rect.w/h and a mesh's own point cloud both come from world2pix, which can land a footprint's
+  // corner(s) anywhere from "a single huge jump" to "a gradual smear across many mesh cells" once a
+  // projection breaks down (confirmed under MOL/AIT/MER, both near a pole and at other declinations)
+  // — every place below that draws straight off screen-space extents (the hidden/dashed outline
+  // here, the mesh path, and the mesh-less fallback) needs a guard against that, or it paints a
+  // rect/image stretched across most of the canvas. The bound itself comes from the footprint's own
+  // real angular size (see expectedFootprintDiagonalPx's own comment for why not e.g. a flat
+  // fraction of the canvas instead) times a generous multiplier — real curvature under a legitimate
+  // projection stretches a footprint some, but nowhere near this large a multiple of its expected
+  // size; a 40px floor keeps a tiny or badly-solved footprint from being held to an unreasonably
+  // strict bound.
+  const maxSpanPx = Math.max(expectedFootprintDiagonalPx(f, aladin, containerW, containerH) * 6, 40);
   if (hidden) {
+    if (w > maxSpanPx || h > maxSpanPx) return;
     ctx.save();
     ctx.translate(cx, cy);
     ctx.rotate(angleRad);
@@ -1160,14 +1221,22 @@ function drawOneAstrobinFootprint(
   // — reordering the corners array by two positions before interpolating is equivalent to that same
   // 180° correction, just expressed as a relabeling instead of an extra rotation.
   const meshCorners = f.corners ?? (([a, b, c, d]) => [c, d, a, b])(footprintCorners(f));
-  const mesh = imageReady
+  const rawMesh = imageReady
     ? computeFootprintMesh(aladin, meshCorners, ASTROBIN_MESH_GRID_SIZE)
     : null;
+  // A mesh whose points collectively sprawl across most of the canvas is just as broken as one
+  // with a single oversized cell (see meshBoundingSpan's own comment) — discard the whole thing
+  // rather than let drawImageMesh paint every individual (locally-small) cell of a row that's
+  // gradually smeared from one edge of the screen to the other.
+  let mesh = rawMesh;
   if (mesh) {
-    const maxSpanPx = Math.max(containerW, containerH) * 3;
+    const { spanX, spanY } = meshBoundingSpan(mesh, ASTROBIN_MESH_GRID_SIZE);
+    if (spanX > maxSpanPx || spanY > maxSpanPx) mesh = null;
+  }
+  if (mesh) {
     drawImageMesh(ctx, img, mesh, ASTROBIN_MESH_GRID_SIZE, maxSpanPx);
     drawMeshOutline(ctx, mesh, ASTROBIN_MESH_GRID_SIZE);
-  } else {
+  } else if (w <= maxSpanPx && h <= maxSpanPx) {
     ctx.save();
     ctx.translate(cx, cy);
     ctx.rotate(angleRad);
@@ -1177,6 +1246,9 @@ function drawOneAstrobinFootprint(
     ctx.strokeRect(-w / 2, -h / 2, w, h);
     ctx.restore();
   }
+  // else: computeFootprintMesh itself failed (e.g. tangentPlaneCenter going non-finite right at a
+  // pole, matching this bug's own repro) and the mesh-less fallback's own w/h were too far gone to
+  // trust either — nothing to draw this frame.
   ctx.globalAlpha = 1;
 }
 
@@ -1196,8 +1268,8 @@ function drawAstrobinFootprints(
   hiddenUrls: Set<string>,
   selectedUrl: string | null,
   imagesCache: Map<string, HTMLImageElement>,
-  onLoadStart: (hash: string) => void,
-  onSettled: (hash: string) => void,
+  onLoadStart: (key: string) => void,
+  onSettled: (key: string) => void,
   containerW: number,
   containerH: number,
   canShowImages: boolean,
@@ -1241,7 +1313,15 @@ function drawAstrobinFootprints(
     // draws for a 254-footprint gallery under ZEA, vs. the handful actually near the current view),
     // which is both a real performance cost and can visually place an unrelated footprint's rotated
     // rectangle back into the visible area purely from projection distortion at the extremes.
-    const halfDiag = Math.hypot(rect.w, rect.h) / 2;
+    //
+    // rect.w/h can themselves already be the wraparound artifact (confirmed under MOL/AIT/MER near
+    // a pole: two corners of the same small footprint project to opposite sides of the all-sky
+    // ellipse, so hypot(w,h) balloons to several times the canvas). Left uncapped, halfDiag grows
+    // right along with it and this filter stops filtering anything — the same maxSpanPx bound
+    // drawImageMesh uses per-cell caps it here too, so a footprint this badly mis-projected is
+    // culled before it ever reaches drawOneAstrobinFootprint's own (mesh-less) fallback below.
+    const maxSpanPx = Math.max(containerW, containerH) * 3;
+    const halfDiag = Math.min(Math.hypot(rect.w, rect.h), maxSpanPx) / 2;
     if (rect.cx < -halfDiag || rect.cx > containerW + halfDiag || rect.cy < -halfDiag || rect.cy > containerH + halfDiag) continue;
     rects.push({ footprint, hidden, ...rect });
     if (footprint.url === selectedUrl && !hidden) {
@@ -1845,12 +1925,13 @@ export function SkyMapCard({
   // touches no layout at all.
   const astrobinCanvasRef = useRef<HTMLCanvasElement>(null);
   const astrobinImagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
-  // Which footprint thumbnails are currently mid-fetch, by hash — a Set rather than a plain
-  // counter so a stray duplicate start/settle call can't drift it out of sync. Non-empty means
+  // Which footprint thumbnails are currently mid-fetch, keyed by thumbnailUrl (see
+  // getAstrobinImage's own comment for why not hash) — a Set rather than a plain counter so a
+  // stray duplicate start/settle call can't drift it out of sync. Non-empty means
   // drawOneAstrobinFootprint holds off on drawing *any* thumbnail this redraw (see canShowImages),
   // so a batch of newly-visible footprints reveals together once they're all ready instead of
   // popping in one at a time as each fetch happens to finish.
-  const pendingAstrobinHashesRef = useRef<Set<string>>(new Set());
+  const pendingAstrobinKeysRef = useRef<Set<string>>(new Set());
   const [pendingAstrobinCount, setPendingAstrobinCount] = useState(0);
   // Flips true (forever) the first time the pending set empties out — see canShowAstrobinImages
   // at the redraw call site below for why the "wait for the whole batch" gate only applies once.
@@ -2476,20 +2557,20 @@ export function SkyMapCard({
           // view show progressively as they load same as before; permanently withholding
           // already-loaded thumbnails every time a newly-panned-in footprint starts fetching would
           // make already-visible images flicker out and back during ordinary panning.
-          const canShowAstrobinImages = hasRevealedAstrobinImagesRef.current || pendingAstrobinHashesRef.current.size === 0;
+          const canShowAstrobinImages = hasRevealedAstrobinImagesRef.current || pendingAstrobinKeysRef.current.size === 0;
           astrobinHitRectsRef.current = showAstrobin && astrobinFootprints
             ? drawAstrobinFootprints(
               ctx, aladin, astrobinFootprints, hiddenAstrobinUrls, astrobinPopover?.footprint.url ?? null,
               astrobinImagesRef.current,
-              (hash) => {
-                if (pendingAstrobinHashesRef.current.has(hash)) return;
-                pendingAstrobinHashesRef.current.add(hash);
-                setPendingAstrobinCount(pendingAstrobinHashesRef.current.size);
+              (key) => {
+                if (pendingAstrobinKeysRef.current.has(key)) return;
+                pendingAstrobinKeysRef.current.add(key);
+                setPendingAstrobinCount(pendingAstrobinKeysRef.current.size);
               },
-              (hash) => {
-                pendingAstrobinHashesRef.current.delete(hash);
-                if (pendingAstrobinHashesRef.current.size === 0) hasRevealedAstrobinImagesRef.current = true;
-                setPendingAstrobinCount(pendingAstrobinHashesRef.current.size);
+              (key) => {
+                pendingAstrobinKeysRef.current.delete(key);
+                if (pendingAstrobinKeysRef.current.size === 0) hasRevealedAstrobinImagesRef.current = true;
+                setPendingAstrobinCount(pendingAstrobinKeysRef.current.size);
                 redrawRef.current();
               },
               container.clientWidth, container.clientHeight,
