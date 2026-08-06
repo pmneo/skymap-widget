@@ -1,4 +1,6 @@
 export { SkyMapCard } from './SkyMapCard';
+// PoC only — see SkyMapCard3D.tsx's own top comment. Not meant to stay exported long-term.
+export { SkyMapCard3D } from './SkyMapCard3D';
 export type { SkyMapDataSource } from './dataSource';
 export type {
   ObservatoryInfo,

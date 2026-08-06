@@ -2389,6 +2389,32 @@ export function SkyMapCard({
       // reset back to SIN.
       aladin.on('projectionChanged', (name: string) => writeStoredString(PROJECTION_KEY, name));
 
+      // Ties every overlay this component draws (FOV rectangle, AstroBin footprints, terrain,
+      // open-target markers, the popover's position) to the *exact* same render tick Aladin uses
+      // for its own tiles — its View class (reached via the undocumented aladin.view, so this could
+      // break on an Aladin upgrade) runs its own perpetual requestAnimationFrame loop that calls
+      // drawAllOverlays() whenever `wasm.isRendering() || needRedraw` is true, right before
+      // scheduling its own next frame. Without this, the poll loop below only noticed a changed
+      // fov/ra/dec up to one animation frame after Aladin had already redrawn its own tiles at the
+      // new position — visible as our overlays (astrobin footprints especially) briefly lagging a
+      // live drag or zoom by a frame. Validated first in SkyMapCard3D.tsx's WebGL PoC (same
+      // technique, much simpler component) before backporting here.
+      const view = aladin.view;
+      if (view && typeof view.drawAllOverlays === 'function') {
+        const originalDrawAllOverlays = view.drawAllOverlays.bind(view);
+        view.drawAllOverlays = (...args: unknown[]) => {
+          originalDrawAllOverlays(...args);
+          try {
+            redrawRef.current();
+          } catch {
+            // Ignored — same transient post-zoom WebGL state the poll loop below guards against
+            // (see its own comment); Aladin calls this again next frame regardless of what this
+            // wrapper does, so a bad frame here costs at most one skipped redraw, never wedges
+            // anything.
+          }
+        };
+      }
+
       const mountCat = window.A.catalog({ name: 'mount', sourceSize: 20, color: '#4ade80' });
       const targetCat = window.A.catalog({ name: 'target', sourceSize: 20, color: '#f59e0b' });
       aladin.addCatalog(mountCat);
@@ -2755,8 +2781,11 @@ export function SkyMapCard({
   useEffect(() => {
     if (!ready) return;
     const aladin = aladinRef.current;
+    // Redraws themselves are now driven by the drawAllOverlays hook in the Aladin-init effect
+    // above, in lockstep with Aladin's own render tick — this only needs to persist the view once
+    // it's actually changed, which is genuinely poll-driven (there's no Aladin event that fires
+    // once per settled pan/zoom rather than once per frame or once per throttle window).
     const onChange = () => {
-      redrawRef.current();
       saveCurrentView(aladin);
     };
 
@@ -2766,7 +2795,8 @@ export function SkyMapCard({
     // ever going through the internal updateZoomState() that triggers it. Polling both fov and
     // center RA/Dec every animation frame instead tracks pan/zoom at the browser's actual refresh
     // rate rather than Aladin's throttled one, and is cheap (a few number compares) next to the
-    // WebGL redraw Aladin is already doing at the same rate.
+    // WebGL redraw Aladin is already doing at the same rate. (This still drives scheduleResync()
+    // and saveCurrentView() below — the redraw itself no longer waits on this loop.)
     let lastFov = aladin.getFov()[0];
     let lastRaDec = aladin.getRaDec();
     let fovSettleTimer: number | undefined;
