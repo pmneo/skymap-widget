@@ -549,6 +549,16 @@
   pointer-events: none;
 }
 
+/* The WebGL-rendered footprint images (drawFootprintImageWebGL) — sits directly underneath
+ * .sky-map-astrobin-canvas in DOM order (see SkyMapCard.tsx) so that canvas's own outline/
+ * hidden-state/gear drawing (and, lacking a WebGL context, its Canvas2D image fallback) paints on
+ * top of it. */
+.sky-map-astrobin-webgl-canvas {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
 /* left/top/display are all set imperatively in redraw() — it has to keep tracking its footprint's
  * own bottom-right corner across pans/zooms (see screenRectBottomRight), the same reason the
  * footprints themselves are positioned that way rather than through React state/CSS. Starts

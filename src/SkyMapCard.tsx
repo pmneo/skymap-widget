@@ -1183,6 +1183,188 @@ function drawMeshOutline(ctx: CanvasRenderingContext2D, mesh: ([number, number] 
   ctx.stroke();
 }
 
+// GPU rasterization of the same mesh drawImageMesh draws with Canvas2D — fills every pixel of a
+// triangle exactly once by construction, so two triangles sharing an edge can't show the faint
+// seam Canvas2D's independent per-call clip()+drawImage() sometimes leaves along mesh-cell
+// boundaries (confirmed live: neither a bigger clip-path overlap nor
+// globalCompositeOperation='copy' fixed it there — see drawTexturedTriangle's own comment). Same
+// technique Aladin itself uses to rasterize its own HiPS tiles. Validated first in
+// SkyMapCard3D.tsx's standalone WebGL PoC before being folded in here as drawOneAstrobinFootprint's
+// preferred path, with drawImageMesh kept as the fallback for a browser/GPU that can't give us a
+// WebGL context at all (see the `webgl` param below).
+const ASTROBIN_WEBGL_VERTEX_SHADER = `
+  attribute vec2 aPosition;
+  attribute vec2 aTexCoord;
+  uniform vec2 uResolution;
+  varying vec2 vTexCoord;
+  void main() {
+    vec2 clip = (aPosition / uResolution) * 2.0 - 1.0;
+    gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
+    vTexCoord = aTexCoord;
+  }
+`;
+
+const ASTROBIN_WEBGL_FRAGMENT_SHADER = `
+  precision mediump float;
+  varying vec2 vTexCoord;
+  uniform sampler2D uTexture;
+  uniform float uOpacity;
+  void main() {
+    vec4 texColor = texture2D(uTexture, vTexCoord);
+    gl_FragColor = vec4(texColor.rgb, texColor.a * uOpacity);
+  }
+`;
+
+function createAstrobinShader(gl: WebGLRenderingContext, type: number, source: string): WebGLShader {
+  const shader = gl.createShader(type)!;
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    const info = gl.getShaderInfoLog(shader);
+    gl.deleteShader(shader);
+    throw new Error(`AstroBin WebGL shader compile failed: ${info}`);
+  }
+  return shader;
+}
+
+function createAstrobinProgram(gl: WebGLRenderingContext): WebGLProgram {
+  const vs = createAstrobinShader(gl, gl.VERTEX_SHADER, ASTROBIN_WEBGL_VERTEX_SHADER);
+  const fs = createAstrobinShader(gl, gl.FRAGMENT_SHADER, ASTROBIN_WEBGL_FRAGMENT_SHADER);
+  const program = gl.createProgram()!;
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    throw new Error(`AstroBin WebGL program link failed: ${gl.getProgramInfoLog(program)}`);
+  }
+  return program;
+}
+
+/** Index buffer for an NxN cell grid — same p00/p10/p01 + p10/p11/p01 diagonal split as
+ * drawImageMesh's own triangulation, so switching a footprint between the WebGL and Canvas2D path
+ * (see the `webgl` fallback below) never changes which diagonal a cell is split on. Depends only on
+ * gridSize, never on where a mesh's vertices actually project to — built once and reused for every
+ * footprint and every redraw. */
+function buildAstrobinMeshIndices(gridSize: number): Uint16Array {
+  const indices: number[] = [];
+  const stride = gridSize + 1;
+  for (let j = 0; j < gridSize; j++) {
+    for (let i = 0; i < gridSize; i++) {
+      const p00 = j * stride + i;
+      const p10 = j * stride + (i + 1);
+      const p01 = (j + 1) * stride + i;
+      const p11 = (j + 1) * stride + (i + 1);
+      indices.push(p00, p10, p01, p10, p11, p01);
+    }
+  }
+  return new Uint16Array(indices);
+}
+
+/** Same (u,v) for every footprint regardless of where it projects to on screen — built once and
+ * reused, only the position buffer needs recomputing per redraw. u=i/N/v=j/N matches
+ * drawImageMesh's own sx=(i/N)*naturalWidth/sy=(j/N)*naturalHeight source-pixel mapping; texture
+ * uploaded with UNPACK_FLIP_Y_WEBGL (see getOrCreateAstrobinTexture) so v=0 lands on the image's own
+ * top row the same way sy=0 does there, without an extra flip here. */
+function buildAstrobinMeshTexCoords(gridSize: number): Float32Array {
+  const coords: number[] = [];
+  const stride = gridSize + 1;
+  for (let j = 0; j < stride; j++) {
+    for (let i = 0; i < stride; i++) {
+      coords.push(i / gridSize, j / gridSize);
+    }
+  }
+  return new Float32Array(coords);
+}
+
+/** Everything created once (Aladin-init-time, see the AstroBin WebGL setup effect) and reused
+ * across every redraw/footprint — only `textures` and the position buffer's own contents change
+ * per-frame. Absent (drawOneAstrobinFootprint gets `null`) when the browser hands back no WebGL
+ * context at all, in which case that function falls back to the Canvas2D drawImageMesh path. */
+interface AstrobinGl {
+  gl: WebGLRenderingContext;
+  program: WebGLProgram;
+  indexBuffer: WebGLBuffer;
+  texCoordBuffer: WebGLBuffer;
+  positionBuffer: WebGLBuffer;
+  indexCount: number;
+  textures: Map<string, WebGLTexture>;
+}
+
+/** Flattens a computeFootprintMesh grid into the Float32Array drawFootprintImageWebGL needs, or
+ * null if any grid point is unprojectable — same belt-and-suspenders reasoning as
+ * computeFootprintMesh itself returning null wholesale rather than drawing a mesh with made-up
+ * points: a WebGL index buffer's triangle connectivity is fixed up front, unlike drawImageMesh's
+ * per-cell skip, so there's no equivalent of "skip just this one cell" here. */
+function meshToPositions(mesh: ([number, number] | null)[][], gridSize: number): Float32Array | null {
+  const stride = gridSize + 1;
+  const positions = new Float32Array(stride * stride * 2);
+  for (let j = 0; j < stride; j++) {
+    for (let i = 0; i < stride; i++) {
+      const p = mesh[j][i];
+      if (!p) return null;
+      const idx = (j * stride + i) * 2;
+      positions[idx] = p[0];
+      positions[idx + 1] = p[1];
+    }
+  }
+  return positions;
+}
+
+/** Uploaded once per thumbnailUrl and reused across redraws — mirrors getAstrobinImage's own
+ * cache-by-key reasoning. Textures straight from the already-loaded HTMLImageElement (getAstrobinImage
+ * already fetched it through the concurrency limiter and decoded it into that Image), so this needs
+ * no fetch/blob/createImageBitmap step of its own the way a from-scratch WebGL loader would. Only
+ * ever called once `imageReady` (img.complete && naturalWidth > 0) is true. */
+function getOrCreateAstrobinTexture(
+  gl: WebGLRenderingContext, cache: Map<string, WebGLTexture>, key: string, img: HTMLImageElement,
+): WebGLTexture {
+  let texture = cache.get(key);
+  if (texture) return texture;
+  texture = gl.createTexture()!;
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  cache.set(key, texture);
+  return texture;
+}
+
+/** Draws one footprint's mesh-warped image via WebGL — the seam-free replacement for
+ * drawImageMesh. cssWidth/cssHeight are the *CSS*-pixel container size (matching the CSS-pixel
+ * units `positions` already carries, straight from world2pix), not the canvas's own (possibly
+ * devicePixelRatio-scaled) backing-store size — gl.viewport is what maps clip space onto the full
+ * backing store regardless, so feeding it the CSS size here keeps this resolution-independent. */
+function drawFootprintImageWebGL(
+  webgl: AstrobinGl, texture: WebGLTexture, positions: Float32Array, opacity: number,
+  cssWidth: number, cssHeight: number,
+) {
+  const { gl, program, indexBuffer, texCoordBuffer, positionBuffer, indexCount } = webgl;
+  gl.useProgram(program);
+  gl.uniform2f(gl.getUniformLocation(program, 'uResolution'), cssWidth, cssHeight);
+  gl.uniform1f(gl.getUniformLocation(program, 'uOpacity'), opacity);
+
+  const aPosition = gl.getAttribLocation(program, 'aPosition');
+  const aTexCoord = gl.getAttribLocation(program, 'aTexCoord');
+  gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+  gl.enableVertexAttribArray(aTexCoord);
+  gl.vertexAttribPointer(aTexCoord, 2, gl.FLOAT, false, 0, 0);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(aPosition);
+  gl.vertexAttribPointer(aPosition, 2, gl.FLOAT, false, 0, 0);
+
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.uniform1i(gl.getUniformLocation(program, 'uTexture'), 0);
+
+  gl.drawElements(gl.TRIANGLES, indexCount, gl.UNSIGNED_SHORT, 0);
+}
+
 function drawOneAstrobinFootprint(
   ctx: CanvasRenderingContext2D,
   aladin: any,
@@ -1199,6 +1381,9 @@ function drawOneAstrobinFootprint(
   // pendingAstrobinImages below. Keeps every image in a redraw pass appearing together instead of
   // popping in one at a time as each fetch happens to finish.
   canShowImages: boolean,
+  // Null when the browser handed back no WebGL context at all (see the AstroBin WebGL setup
+  // effect) — drawImageMesh is the Canvas2D fallback for that case, seam and all.
+  webgl: AstrobinGl | null,
 ) {
   const { cx, cy, w, h, angleRad } = rect;
   // rect.w/h and a mesh's own point cloud both come from world2pix, which can land a footprint's
@@ -1259,7 +1444,18 @@ function drawOneAstrobinFootprint(
     if (spanX > maxSpanPx || spanY > maxSpanPx) mesh = null;
   }
   if (mesh) {
-    if (imageReady) drawImageMesh(ctx, img, mesh, ASTROBIN_MESH_GRID_SIZE, maxSpanPx);
+    if (imageReady) {
+      const positions = webgl ? meshToPositions(mesh, ASTROBIN_MESH_GRID_SIZE) : null;
+      if (webgl && positions) {
+        const texture = getOrCreateAstrobinTexture(webgl.gl, webgl.textures, f.thumbnailUrl, img);
+        drawFootprintImageWebGL(webgl, texture, positions, isSelected ? 1 : 0.8, containerW, containerH);
+      } else {
+        // No WebGL context, or a grid point went unprojectable this one frame (see
+        // meshToPositions) — Canvas2D per-triangle drawing as a fallback, seam and all, rather
+        // than not drawing the image at all.
+        drawImageMesh(ctx, img, mesh, ASTROBIN_MESH_GRID_SIZE, maxSpanPx);
+      }
+    }
     drawMeshOutline(ctx, mesh, ASTROBIN_MESH_GRID_SIZE);
   } else if (w <= maxSpanPx && h <= maxSpanPx) {
     ctx.save();
@@ -1298,6 +1494,7 @@ function drawAstrobinFootprints(
   containerW: number,
   containerH: number,
   canShowImages: boolean,
+  webgl: AstrobinGl | null,
 ): AstrobinHitRect[] {
   const rects: AstrobinHitRect[] = [];
   let selectedEntry: { footprint: AstrobinFootprint; rect: ScreenRect } | null = null;
@@ -1353,10 +1550,10 @@ function drawAstrobinFootprints(
       selectedEntry = { footprint, rect };
       continue;
     }
-    drawOneAstrobinFootprint(ctx, aladin, footprint, rect, hidden, false, imagesCache, onLoadStart, onSettled, containerW, containerH, canShowImages);
+    drawOneAstrobinFootprint(ctx, aladin, footprint, rect, hidden, false, imagesCache, onLoadStart, onSettled, containerW, containerH, canShowImages, webgl);
   }
   if (selectedEntry) {
-    drawOneAstrobinFootprint(ctx, aladin, selectedEntry.footprint, selectedEntry.rect, false, true, imagesCache, onLoadStart, onSettled, containerW, containerH, canShowImages);
+    drawOneAstrobinFootprint(ctx, aladin, selectedEntry.footprint, selectedEntry.rect, false, true, imagesCache, onLoadStart, onSettled, containerW, containerH, canShowImages, webgl);
   }
   return rects;
 }
@@ -1950,6 +2147,15 @@ export function SkyMapCard({
   // touches no layout at all.
   const astrobinCanvasRef = useRef<HTMLCanvasElement>(null);
   const astrobinImagesRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  // WebGL layer for just the footprint *image* pixels — see drawFootprintImageWebGL's own comment
+  // for why (Canvas2D mesh-seam artifact). Sits directly under astrobinCanvasRef in DOM order (see
+  // the JSX below), which now only draws the mesh outline, hidden/dashed state, and gear button —
+  // never the image itself when this is available. astrobinGlRef.current stays null if the
+  // browser hands back no WebGL context at all; drawOneAstrobinFootprint falls back to the old
+  // Canvas2D drawImageMesh in that case.
+  const astrobinWebglCanvasRef = useRef<HTMLCanvasElement>(null);
+  const astrobinGlRef = useRef<AstrobinGl | null>(null);
+  const astrobinTexturesRef = useRef<Map<string, WebGLTexture>>(new Map());
   // Which footprint thumbnails are currently mid-fetch, keyed by thumbnailUrl (see
   // getAstrobinImage's own comment for why not hash) — a Set rather than a plain counter so a
   // stray duplicate start/settle call can't drift it out of sync. Non-empty means
@@ -1966,6 +2172,39 @@ export function SkyMapCard({
   const astrobinHitRectsRef = useRef<AstrobinHitRect[]>([]);
   const astrobinFetchedRef = useRef(false);
   const appliedSurveyIdRef = useRef<string | null>(null);
+
+  // Program + static buffers only need creating once — the index/texcoord buffers depend on
+  // ASTROBIN_MESH_GRID_SIZE alone, never on any footprint's own data, unlike the position buffer
+  // (rebuilt per footprint per redraw, see drawFootprintImageWebGL). Runs once on mount, same as
+  // the Aladin-init effect above; astrobinGlRef staying null (no `webgl` object ever gets built)
+  // is exactly how drawOneAstrobinFootprint's Canvas2D fallback gets exercised on a browser/GPU
+  // that can't give us a WebGL context at all.
+  useEffect(() => {
+    const canvas = astrobinWebglCanvasRef.current;
+    if (!canvas) return;
+    const gl = canvas.getContext('webgl');
+    if (!gl) return;
+    const program = createAstrobinProgram(gl);
+    const indexBuffer = gl.createBuffer()!;
+    const texCoordBuffer = gl.createBuffer()!;
+    const positionBuffer = gl.createBuffer()!;
+
+    const indices = buildAstrobinMeshIndices(ASTROBIN_MESH_GRID_SIZE);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+
+    const texCoords = buildAstrobinMeshTexCoords(ASTROBIN_MESH_GRID_SIZE);
+    gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, texCoords, gl.STATIC_DRAW);
+
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    astrobinGlRef.current = {
+      gl, program, indexBuffer, texCoordBuffer, positionBuffer,
+      indexCount: indices.length, textures: astrobinTexturesRef.current,
+    };
+  }, []);
   // The flat geometric horizon + any enabled artificial-horizon regions — plain canvas drawing
   // (drawHorizonOverlay), not Aladin's own A.polygon/graphicOverlay: Aladin's polygon renderer
   // crashes outright (TypeError reading 'x' of undefined) the moment any one vertex fails to
@@ -2585,6 +2824,26 @@ export function SkyMapCard({
         }
       }
 
+      const webglCanvas = astrobinWebglCanvasRef.current;
+      const webgl = astrobinGlRef.current;
+      if (webglCanvas && webgl && container) {
+        // Same backing-store-at-devicePixelRatio reasoning as astrobinCanvasRef just below —
+        // gl.viewport needs the backing-store (device-pixel) size, but drawFootprintImageWebGL's
+        // own uResolution uniform stays in CSS pixels to match world2pix's own units (see its
+        // comment).
+        const dpr = window.devicePixelRatio || 1;
+        const targetW = Math.round(container.clientWidth * dpr);
+        const targetH = Math.round(container.clientHeight * dpr);
+        if (webglCanvas.width !== targetW || webglCanvas.height !== targetH) {
+          webglCanvas.width = targetW;
+          webglCanvas.height = targetH;
+          webglCanvas.style.width = `${container.clientWidth}px`;
+          webglCanvas.style.height = `${container.clientHeight}px`;
+          webgl.gl.viewport(0, 0, targetW, targetH);
+        }
+        webgl.gl.clear(webgl.gl.COLOR_BUFFER_BIT);
+      }
+
       const canvas = astrobinCanvasRef.current;
       if (canvas && container) {
         // Backing store at devicePixelRatio for crisp rendering on retina displays; draw calls
@@ -2626,6 +2885,7 @@ export function SkyMapCard({
               },
               container.clientWidth, container.clientHeight,
               canShowAstrobinImages,
+              webgl,
             )
             : [];
         }
@@ -3596,6 +3856,11 @@ export function SkyMapCard({
             className="sky-map-last-image"
           />
         )}
+        {/* The footprint images themselves — WebGL, seam-free (see drawFootprintImageWebGL). Sits
+            directly under astrobinCanvasRef, which now only draws mesh outlines, the hidden/dashed
+            state, and the gear button on top of whatever this paints (or, lacking a WebGL context,
+            its own Canvas2D drawImageMesh fallback — see AstrobinGl's own comment). */}
+        <canvas ref={astrobinWebglCanvasRef} className="sky-map-astrobin-webgl-canvas" />
         <canvas ref={astrobinCanvasRef} className="sky-map-astrobin-canvas" />
         <canvas ref={terrainCanvasRef} className="sky-map-terrain-canvas" />
         {/* Painted last (on top of the terrain photo and AstroBin footprints) so the horizon line
