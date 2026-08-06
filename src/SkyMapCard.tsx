@@ -3477,7 +3477,10 @@ export function SkyMapCard({
       // hover (see the z-index rule in index.css) still lifts whichever one you're pointing at.
       .then((footprints) => [...footprints].sort((a, b) => footprintAreaDeg2(b) - footprintAreaDeg2(a)))
       .then(setAstrobinFootprints)
-      .catch(() => { /* AstroBin unreachable — leave the toggle checked but nothing drawn, no retry loop */ });
+      // AstroBin unreachable — leave the toggle checked but nothing drawn, no retry loop. Still
+      // has to leave `null` (still-loading) for an empty array (nothing to show) though, or the
+      // loading bar above spins forever instead of just giving up.
+      .catch(() => setAstrobinFootprints([]));
   }, [showAstrobin]);
 
   useEffect(() => {
@@ -3854,7 +3857,12 @@ export function SkyMapCard({
         className="sky-map"
         onClick={handleAstrobinClick}
       >
-        {showAstrobin && pendingAstrobinCount > 0 && (
+        {/* Covers the whole loading lifecycle, not just thumbnails: astrobinFootprints is null
+            until the footprint *list* itself has been fetched (see the effect below), which for a
+            few hundred footprints is itself not instant — without this half, toggling AstroBin on
+            showed nothing at all (no bar, no footprints) for that entire stretch, only starting to
+            show progress once thumbnails began loading. */}
+        {showAstrobin && (astrobinFootprints === null || pendingAstrobinCount > 0) && (
           <div className="sky-map-astrobin-loading" aria-hidden>
             <div className="sky-map-astrobin-loading-bar" />
           </div>
