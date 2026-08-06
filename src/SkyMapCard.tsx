@@ -939,8 +939,13 @@ function hitTestAstrobinFootprint(x: number, y: number, rects: AstrobinHitRect[]
 // Shared by every getAstrobinImage call below (module-level, not per-render) — a gallery with a
 // few dozen simultaneously-visible footprints (see drawAstrobinFootprints' own comment) used to
 // fire one `new Image().src = url` per footprint at once, easily blowing past the browser's
-// 6-connections-per-origin limit on its own.
-const astrobinThumbnailLimiter = createConcurrencyLimiter(3);
+// 6-connections-per-origin limit on its own. 4 rather than the full 6 (or the old 3): these share
+// the same origin as the HiPS tile proxy and every other API call this component makes, so this
+// leaves some of that per-origin budget free for those instead of thumbnails claiming all of it —
+// each slot only frees once its own fetch's body has fully downloaded and become a Blob (see
+// createConcurrencyLimiter), not just once headers arrive, so this is also a cap on simultaneous
+// in-flight downloads, not just requests-issued.
+const astrobinThumbnailLimiter = createConcurrencyLimiter(4);
 
 /** Loaded once per thumbnailUrl and reused across redraws/frames — plain Image objects rather than
  * DOM <img> elements, since these are only ever drawImage()'d onto the canvas, never inserted.
