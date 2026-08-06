@@ -1262,9 +1262,9 @@ function buildAstrobinMeshIndices(gridSize: number): Uint16Array {
 
 /** Same (u,v) for every footprint regardless of where it projects to on screen — built once and
  * reused, only the position buffer needs recomputing per redraw. u=i/N/v=j/N matches
- * drawImageMesh's own sx=(i/N)*naturalWidth/sy=(j/N)*naturalHeight source-pixel mapping; texture
- * uploaded with UNPACK_FLIP_Y_WEBGL (see getOrCreateAstrobinTexture) so v=0 lands on the image's own
- * top row the same way sy=0 does there, without an extra flip here. */
+ * drawImageMesh's own sx=(i/N)*naturalWidth/sy=(j/N)*naturalHeight source-pixel mapping directly —
+ * v=0 lands on the image's own top row the same way sy=0 does there, with texture upload left
+ * un-flipped (see getOrCreateAstrobinTexture's own comment for why FLIP_Y_WEBGL is wrong here). */
 function buildAstrobinMeshTexCoords(gridSize: number): Float32Array {
   const coords: number[] = [];
   const stride = gridSize + 1;
@@ -1322,7 +1322,13 @@ function getOrCreateAstrobinTexture(
   if (texture) return texture;
   texture = gl.createTexture()!;
   gl.bindTexture(gl.TEXTURE_2D, texture);
-  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  // NOT flipped — confirmed live (comparing a landscape/comet shot's own left-right handedness,
+  // road vs. comet-tail direction, against the real photo) that UNPACK_FLIP_Y_WEBGL=true mirrors
+  // every footprint vertically instead of matching drawImageMesh's own sy=(j/N)*naturalHeight,
+  // which needs no flip at all since Canvas2D's source-pixel Y already runs top-to-bottom, same
+  // direction computeFootprintMesh's own v does. Left this comment instead of just quietly fixing
+  // it, since the "obvious" WebGL convention (this flag is *supposed* to make top-left-origin
+  // texcoords act intuitive) turned out backwards for how this specific texture is sampled.
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
