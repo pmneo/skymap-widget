@@ -485,13 +485,30 @@ interface Props {
  * which is only valid for a small FOV far from the pole: near the pole cos(dec) collapses toward
  * 0, blowing up that division, and a mount/Planning FOV rectangle centered near the pole rendered
  * as a triangle (or two) instead of a rectangle — confirmed by reproducing a slew through the pole
- * and inspecting the resulting corners. dx is flipped (+dx = West, not East) — verified
- * empirically: RA increases to the left on an unmirrored equatorial display, so a plain
- * +East-is-right offset renders the overlay image mirrored left-right; xi has the same "increasing
- * = East" sign as a plain RA offset (see gnomonicXiEta), so the same flip applies here too. */
-function fovCorners(centerRa: number, centerDec: number, widthDeg: number, heightDeg: number, paDeg: number): [number, number][] {
+ * and inspecting the resulting corners. dx is flipped (+dx = West, not East) for the live-capture
+ * callers (mount/Planning FOV) — verified empirically against Ekos's own `pa`: RA increases to the
+ * left on an unmirrored equatorial display, so a plain +East-is-right offset rendered the overlay
+ * image mirrored left-right; xi has the same "increasing = East" sign as a plain RA offset (see
+ * gnomonicXiEta), so the same flip applies here too.
+ *
+ * `mirrored` exists because AstroBin's own "orientation" convention (used for footprints without
+ * an Advanced Plate Solving corner solution — see footprintCorners) turned out to need the *other*
+ * sign here, not the one Ekos's `pa` needs. Confirmed live against real basic-solve-only images at
+ * two very different orientation angles: with the Ekos-derived sign, the rendered footprint was a
+ * left-right mirror of the true photo in each case (checked directly against the true photo's own
+ * asymmetric detail — a nebula-edge notch in one case, a companion object's position in the other,
+ * both landing on the wrong side) — flipping this one sign for that caller fixed both, without
+ * touching the live-capture overlay's own (already-correct) convention. This isn't a per-user optics
+ * quirk: it's that Advanced-solve footprints get their real per-corner RA/Dec straight from AstroBin (so
+ * whatever the image's actual parity is comes along for free, see footprintCorners), while a
+ * basic solve gives us only a single scalar orientation angle with no parity information at all —
+ * we have to pick a sign ourselves, and this is the one that actually matches AstroBin's convention. */
+function fovCorners(
+  centerRa: number, centerDec: number, widthDeg: number, heightDeg: number, paDeg: number,
+  mirrored: boolean = false,
+): [number, number][] {
   const paRad = (paDeg * Math.PI) / 180;
-  const halfW = widthDeg / 2;
+  const halfW = (mirrored ? -1 : 1) * widthDeg / 2;
   const halfH = heightDeg / 2;
   const offsets: [number, number][] = [[halfW, -halfH], [-halfW, -halfH], [-halfW, halfH], [halfW, halfH]];
   return offsets.map(([dx, dy]) => {
@@ -767,8 +784,13 @@ function astrobinSearchUrl(name: string): string {
   return `https://www.astrobin.com/search/?q=${encodeURIComponent(name)}`;
 }
 
+/** f.corners (Advanced Plate Solving) are real per-corner RA/Dec straight from AstroBin, so the
+ * image's actual parity comes along with them for free — no assumption needed. Without that (a
+ * basic solve, just center + size + a single orientation angle, no parity info at all), fovCorners
+ * needs `mirrored: true` here specifically — see its own comment for why this is AstroBin's
+ * convention, not the same sign the live-capture overlay's Ekos `pa` needs. */
 function footprintCorners(f: AstrobinFootprint): [number, number][] {
-  return f.corners ?? fovCorners(f.ra, f.dec, f.widthDeg, f.heightDeg, f.orientationDeg);
+  return f.corners ?? fovCorners(f.ra, f.dec, f.widthDeg, f.heightDeg, f.orientationDeg, true);
 }
 
 /** Great-circle angular separation between two sky points, in degrees (haversine formula) — used
