@@ -2208,8 +2208,19 @@ export function SkyMapCard({
     gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, texCoords, gl.STATIC_DRAW);
 
+    // blendFuncSeparate, not blendFunc: with a single SRC_ALPHA/ONE_MINUS_SRC_ALPHA pair applied to
+    // *both* color and alpha, drawing onto this canvas's own cleared-to-(0,0,0,0) backing buffer
+    // leaves the stored alpha at uOpacity² (0.8*0.8=0.64), not uOpacity — the alpha channel gets
+    // the same SRC_ALPHA weighting as color, so it's blended against a starting alpha of 0 instead
+    // of just accumulated. Since this canvas's context defaults to premultipliedAlpha:true, the
+    // browser then composites that too-low alpha straight onto the page, making every footprint
+    // visibly dimmer than the requested opacity (confirmed live — this is what made footprint
+    // opacity look like it had regressed after the WebGL rewrite, not any change to the 0.8/1
+    // values themselves, which were never touched). Blending alpha via ONE/ONE_MINUS_SRC_ALPHA
+    // instead (straight "over" accumulation) gives the correct result: alpha = uOpacity + 0*(1 -
+    // uOpacity) = uOpacity.
     gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 
     astrobinGlRef.current = {
       gl, program, indexBuffer, texCoordBuffer, positionBuffer,
