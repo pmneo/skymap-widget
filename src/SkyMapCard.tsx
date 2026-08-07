@@ -875,8 +875,21 @@ interface AstrobinHitRect extends ScreenRect {
   hidden: boolean;
 }
 
-const ASTROBIN_GEAR_SIZE = 20;
 const ASTROBIN_GEAR_MARGIN = 2;
+const ASTROBIN_GEAR_SIZE_FRACTION = 0.18;
+const ASTROBIN_GEAR_SIZE_MIN = 8;
+const ASTROBIN_GEAR_SIZE_MAX = 20;
+
+/** A fixed 20px gear button looked absurdly oversized on a footprint rendered as a tiny diamond
+ * at wide FOV, and comparatively tiny on one spanning most of the canvas — this scales it with
+ * the footprint's own on-screen size instead (clamped so it never gets small enough to miss on a
+ * genuinely tiny footprint, or large enough to swallow one). Kept deliberately on the small side
+ * even at MAX — a settings icon calling attention to itself on a footprint you can't currently see
+ * anyway (that's the whole point of hiding it) is more clutter than affordance. Shared by the draw
+ * and hit-test code so they can't drift apart, same reasoning as astrobinGearCenter below. */
+function astrobinGearSize(r: ScreenRect): number {
+  return clamp(Math.min(r.w, r.h) * ASTROBIN_GEAR_SIZE_FRACTION, ASTROBIN_GEAR_SIZE_MIN, ASTROBIN_GEAR_SIZE_MAX);
+}
 
 /** Point-in-rotated-rectangle test: rotate the query point into the rectangle's own local
  * (unrotated) frame around its center, then it's a plain axis-aligned bounds check. */
@@ -888,11 +901,36 @@ function pointInRotatedRect(px: number, py: number, r: ScreenRect): [number, num
   return [localX, localY];
 }
 
-/** The gear button's local position within its (hidden) footprint's own rotated frame — top-right
- * corner inset by ASTROBIN_GEAR_MARGIN, matching the old CSS `top: 2px; right: 2px`. Shared by the
- * draw and hit-test code so they can't drift apart. */
-function astrobinGearCenter(r: ScreenRect): [number, number] {
-  return [r.w / 2 - ASTROBIN_GEAR_MARGIN - ASTROBIN_GEAR_SIZE / 2, -r.h / 2 + ASTROBIN_GEAR_MARGIN + ASTROBIN_GEAR_SIZE / 2];
+/** The gear button's *absolute* screen position — top-right corner of the footprint's own rotated
+ * frame, inset by ASTROBIN_GEAR_MARGIN (matching the old CSS `top: 2px; right: 2px`), converted out
+ * of that local frame and then clamped to stay within the visible canvas. Shared by the draw and
+ * hit-test code so they can't drift apart.
+ *
+ * Two distinct problems this guards against, both confirmed live:
+ * - A footprint smaller than the gear's own (clamped) minimum size: without the local offsetX/Y
+ *   floor at 0, the inset math goes negative and keeps growing as the footprint keeps shrinking,
+ *   sliding the icon past the shape's own center and out its *opposite* side into empty space —
+ *   this is what "scales out of the corner into nothing" looked like. Flooring at 0 instead settles
+ *   the icon at the shape's own center once it's too small to inset into properly.
+ * - A footprint far *larger* than the current view (e.g. a wide-field shot zoomed in close): its
+ *   real corner can sit thousands of pixels outside the canvas entirely, taking the whole hidden
+ *   indicator (gear included) with it — with nothing else drawn for a hidden footprint, that left
+ *   no way to click it back on short of zooming back out. Clamping the *absolute* position to the
+ *   canvas bounds (with a small margin) keeps it reachable regardless of how far off-screen the
+ *   footprint's own corner has scrolled. */
+function astrobinGearCenter(r: ScreenRect, containerW: number, containerH: number): [number, number] {
+  const size = astrobinGearSize(r);
+  const localX = Math.max(0, r.w / 2 - ASTROBIN_GEAR_MARGIN - size / 2);
+  const localY = -Math.max(0, r.h / 2 - ASTROBIN_GEAR_MARGIN - size / 2);
+  const cos = Math.cos(r.angleRad);
+  const sin = Math.sin(r.angleRad);
+  const absoluteX = r.cx + localX * cos - localY * sin;
+  const absoluteY = r.cy + localX * sin + localY * cos;
+  const edgeMargin = size / 2 + ASTROBIN_GEAR_MARGIN;
+  return [
+    clamp(absoluteX, edgeMargin, containerW - edgeMargin),
+    clamp(absoluteY, edgeMargin, containerH - edgeMargin),
+  ];
 }
 
 /** The rect's own bottom-right corner in screen space — not just cx+w/2,cy+h/2, since the box is
@@ -919,17 +957,24 @@ function screenRectBottomRight(r: ScreenRect): [number, number] {
  * topmost thing under the cursor wins. Hidden footprints only expose their small gear button —
  * the canvas equivalent of the old wrapper's `pointer-events: none` — so the rest of their (still
  * wide-field-sized) box doesn't shadow whatever's underneath. */
-function hitTestAstrobinFootprint(x: number, y: number, rects: AstrobinHitRect[]): { footprint: AstrobinFootprint; onGear: boolean } | null {
+function hitTestAstrobinFootprint(
+  x: number, y: number, rects: AstrobinHitRect[], containerW: number, containerH: number,
+): { footprint: AstrobinFootprint; onGear: boolean } | null {
   for (let i = rects.length - 1; i >= 0; i--) {
     const r = rects[i];
-    const [localX, localY] = pointInRotatedRect(x, y, r);
     if (r.hidden) {
-      const [gx, gy] = astrobinGearCenter(r);
-      if (Math.abs(localX - gx) <= ASTROBIN_GEAR_SIZE / 2 && Math.abs(localY - gy) <= ASTROBIN_GEAR_SIZE / 2) {
+      // Absolute screen space, not pointInRotatedRect's local frame — astrobinGearCenter's own
+      // position is already clamped to the canvas in absolute coordinates (see its own comment for
+      // why), so comparing against a rotated-local mouse position here would silently undo that
+      // clamp for hit-testing even though the drawn icon itself stayed correctly on-screen.
+      const [gx, gy] = astrobinGearCenter(r, containerW, containerH);
+      const gearSize = astrobinGearSize(r);
+      if (Math.abs(x - gx) <= gearSize / 2 && Math.abs(y - gy) <= gearSize / 2) {
         return { footprint: r.footprint, onGear: true };
       }
       continue;
     }
+    const [localX, localY] = pointInRotatedRect(x, y, r);
     if (Math.abs(localX) <= r.w / 2 && Math.abs(localY) <= r.h / 2) {
       return { footprint: r.footprint, onGear: false };
     }
@@ -1246,6 +1291,39 @@ function createAstrobinProgram(gl: WebGLRenderingContext): WebGLProgram {
   return program;
 }
 
+// Solid-color line variant of the same shader, for the mesh outline (see drawFootprintOutlineWebGL
+// below) — reuses the exact same clip-space conversion, just no texture sampling.
+const ASTROBIN_LINE_VERTEX_SHADER = `
+  attribute vec2 aPosition;
+  uniform vec2 uResolution;
+  void main() {
+    vec2 clip = (aPosition / uResolution) * 2.0 - 1.0;
+    gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
+  }
+`;
+
+const ASTROBIN_LINE_FRAGMENT_SHADER = `
+  precision mediump float;
+  uniform vec3 uColor;
+  uniform float uOpacity;
+  void main() {
+    gl_FragColor = vec4(uColor, uOpacity);
+  }
+`;
+
+function createAstrobinLineProgram(gl: WebGLRenderingContext): WebGLProgram {
+  const vs = createAstrobinShader(gl, gl.VERTEX_SHADER, ASTROBIN_LINE_VERTEX_SHADER);
+  const fs = createAstrobinShader(gl, gl.FRAGMENT_SHADER, ASTROBIN_LINE_FRAGMENT_SHADER);
+  const program = gl.createProgram()!;
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    throw new Error(`AstroBin WebGL line program link failed: ${gl.getProgramInfoLog(program)}`);
+  }
+  return program;
+}
+
 /** Index buffer for an NxN cell grid — same p00/p10/p01 + p10/p11/p01 diagonal split as
  * drawImageMesh's own triangulation, so switching a footprint between the WebGL and Canvas2D path
  * (see the `webgl` fallback below) never changes which diagonal a cell is split on. Depends only on
@@ -1294,6 +1372,11 @@ interface AstrobinGl {
   positionBuffer: WebGLBuffer;
   indexCount: number;
   textures: Map<string, WebGLTexture>;
+  // For the mesh outline (see drawFootprintOutlineWebGL) — a separate program+buffer, not reused
+  // from the image ones above, since this draws GL_LINE_LOOP with a solid-color shader instead of
+  // GL_TRIANGLES with a textured one.
+  lineProgram: WebGLProgram;
+  linePositionBuffer: WebGLBuffer;
 }
 
 /** Flattens a computeFootprintMesh grid into the Float32Array drawFootprintImageWebGL needs, or
@@ -1314,6 +1397,61 @@ function meshToPositions(mesh: ([number, number] | null)[][], gridSize: number):
     }
   }
   return positions;
+}
+
+/** Extracts the mesh's own boundary loop from an already-flattened `positions` array (see
+ * meshToPositions) — same perimeter walk drawMeshOutline does directly against the mesh grid (top
+ * row L→R, right column T→B, bottom row R→L, left column B→T), just reading out of the flat
+ * buffer instead. Stops one point short of closing the loop explicitly (unlike drawMeshOutline's
+ * own ctx.lineTo-back-to-start): gl.LINE_LOOP already connects the last vertex back to the first,
+ * so repeating that first point here would draw a zero-length extra segment. */
+function buildOutlineLoopPositions(positions: Float32Array, gridSize: number): Float32Array {
+  const stride = gridSize + 1;
+  const at = (i: number, j: number) => (j * stride + i) * 2;
+  const indices: number[] = [];
+  for (let i = 0; i <= gridSize; i++) indices.push(at(i, 0));
+  for (let j = 1; j <= gridSize; j++) indices.push(at(gridSize, j));
+  for (let i = gridSize - 1; i >= 0; i--) indices.push(at(i, gridSize));
+  for (let j = gridSize - 1; j >= 1; j--) indices.push(at(0, j));
+  const out = new Float32Array(indices.length * 2);
+  indices.forEach((idx, n) => {
+    out[n * 2] = positions[idx];
+    out[n * 2 + 1] = positions[idx + 1];
+  });
+  return out;
+}
+
+/** Draws one footprint's mesh outline via WebGL, on the *same* canvas (and so the same per-
+ * footprint draw order) as drawFootprintImageWebGL — the whole reason this exists at all.
+ * Outlines used to always live on the Canvas2D layer (astrobinCanvasRef), which sits permanently
+ * above the WebGL image layer in DOM/CSS stacking order regardless of which footprint is
+ * "selected" — confirmed live that this let an *overlying* footprint's outline stay visibly drawn
+ * on top of a *background* footprint's image the moment you selected the background one (its
+ * image correctly jumped to the front of the WebGL layer, but every other footprint's outline
+ * still sat above the *entire* WebGL layer unconditionally). Interleaving image+outline through
+ * the same WebGL draw call sequence, in the same order, restores the single consistent z-order
+ * the pre-WebGL Canvas2D-only version had by construction. Only used when the image itself drew
+ * via WebGL this frame (see the call site) — Canvas2D's own drawMeshOutline stays correct paired
+ * with drawImageMesh's own Canvas2D fallback, since both live on that same (single) canvas. */
+function drawFootprintOutlineWebGL(
+  webgl: AstrobinGl, positions: Float32Array, gridSize: number, opacity: number,
+  cssWidth: number, cssHeight: number,
+) {
+  const { gl, lineProgram, linePositionBuffer } = webgl;
+  const loop = buildOutlineLoopPositions(positions, gridSize);
+  gl.useProgram(lineProgram);
+  gl.uniform2f(gl.getUniformLocation(lineProgram, 'uResolution'), cssWidth, cssHeight);
+  gl.uniform1f(gl.getUniformLocation(lineProgram, 'uOpacity'), opacity);
+  // #22d3ee (cyan-400) — same color drawMeshOutline's own ctx.strokeStyle uses.
+  gl.uniform3f(gl.getUniformLocation(lineProgram, 'uColor'), 0x22 / 255, 0xd3 / 255, 0xee / 255);
+
+  const aPosition = gl.getAttribLocation(lineProgram, 'aPosition');
+  gl.bindBuffer(gl.ARRAY_BUFFER, linePositionBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, loop, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(aPosition);
+  gl.vertexAttribPointer(aPosition, 2, gl.FLOAT, false, 0, 0);
+
+  gl.drawArrays(gl.LINE_LOOP, 0, loop.length / 2);
 }
 
 /** Uploaded once per thumbnailUrl and reused across redraws — mirrors getAstrobinImage's own
@@ -1410,28 +1548,6 @@ function drawOneAstrobinFootprint(
   // size; a 40px floor keeps a tiny or badly-solved footprint from being held to an unreasonably
   // strict bound.
   const maxSpanPx = Math.max(expectedFootprintDiagonalPx(f, aladin, containerW, containerH) * 6, 40);
-  if (hidden) {
-    if (w > maxSpanPx || h > maxSpanPx) return;
-    ctx.save();
-    ctx.translate(cx, cy);
-    ctx.rotate(angleRad);
-    ctx.strokeStyle = '#22d3ee';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([4, 3]);
-    ctx.strokeRect(-w / 2, -h / 2, w, h);
-    ctx.setLineDash([]);
-    const [gx, gy] = astrobinGearCenter(rect);
-    drawGearButton(ctx, gx, gy, ASTROBIN_GEAR_SIZE);
-    ctx.restore();
-    return;
-  }
-  const img = getAstrobinImage(imagesCache, f, onLoadStart, onSettled);
-  const imageReady = canShowImages && img.complete && img.naturalWidth > 0;
-  // opacity applies to the image AND its outline together, matching the old CSS behavior of
-  // opacity on the whole footprint element.
-  ctx.globalAlpha = isSelected ? 1 : 0.8;
-  ctx.strokeStyle = '#22d3ee';
-  ctx.lineWidth = 1;
   // The screen-projection curvature a mesh corrects for applies to *any* sky-registered rectangle,
   // not just real per-corner solves — the ra/dec/width/height/orientation fallback's 4 corners
   // (from fovCorners) bend under the current projection exactly the same way. Its corners come out
@@ -1440,11 +1556,14 @@ function drawOneAstrobinFootprint(
   // — reordering the corners array by two positions before interpolating is equivalent to that same
   // 180° correction, just expressed as a relabeling instead of an extra rotation.
   const meshCorners = f.corners ?? (([a, b, c, d]) => [c, d, a, b])(footprintCorners(f));
-  // Computed regardless of imageReady: the mesh is just the sky-curvature geometry, no image
-  // pixels involved (drawMeshOutline traces it, drawImageMesh separately textures it) — gating it
-  // on imageReady meant the outline shown while a thumbnail is still loading was a plain
+  // Computed regardless of hidden/imageReady: the mesh is just the sky-curvature geometry, no
+  // image pixels involved (drawMeshOutline traces it, drawImageMesh separately textures it) —
+  // gating it on imageReady meant the outline shown while a thumbnail is still loading was a plain
   // straight-sided rect instead of the true (slightly curved) shape, purely because texturing and
-  // outlining used to be bundled behind the same condition.
+  // outlining used to be bundled behind the same condition. Same reasoning extends to the hidden
+  // state below: it used to always fall back to a flat rotated rectangle regardless of whether a
+  // real mesh was available, so a hidden footprint's outline looked like a different (simpler)
+  // shape than the one it reveals back into on unhide.
   const rawMesh = computeFootprintMesh(aladin, meshCorners, ASTROBIN_MESH_GRID_SIZE);
   // A mesh whose points collectively sprawl across most of the canvas is just as broken as one
   // with a single oversized cell (see meshBoundingSpan's own comment) — discard the whole thing
@@ -1455,12 +1574,52 @@ function drawOneAstrobinFootprint(
     const { spanX, spanY } = meshBoundingSpan(mesh, ASTROBIN_MESH_GRID_SIZE);
     if (spanX > maxSpanPx || spanY > maxSpanPx) mesh = null;
   }
+
+  if (hidden) {
+    if (!mesh && (w > maxSpanPx || h > maxSpanPx)) return;
+    ctx.save();
+    ctx.strokeStyle = '#22d3ee';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]);
+    if (mesh) {
+      drawMeshOutline(ctx, mesh, ASTROBIN_MESH_GRID_SIZE);
+    } else {
+      ctx.translate(cx, cy);
+      ctx.rotate(angleRad);
+      ctx.strokeRect(-w / 2, -h / 2, w, h);
+    }
+    ctx.restore();
+    // Absolute screen coordinates already (see astrobinGearCenter's own comment) — no
+    // translate/rotate needed here, unlike the outline above. Doesn't need one anyway: the gear's
+    // own 8-tooth glyph (see drawGearButton) is rotationally symmetric at 45° increments, so the
+    // footprint's own rotation angle would never have been visible on it regardless.
+    const [gx, gy] = astrobinGearCenter(rect, containerW, containerH);
+    drawGearButton(ctx, gx, gy, astrobinGearSize(rect));
+    return;
+  }
+
+  const img = getAstrobinImage(imagesCache, f, onLoadStart, onSettled);
+  const imageReady = canShowImages && img.complete && img.naturalWidth > 0;
+  // opacity applies to the image AND its outline together, matching the old CSS behavior of
+  // opacity on the whole footprint element.
+  ctx.globalAlpha = isSelected ? 1 : 0.8;
+  ctx.strokeStyle = '#22d3ee';
+  ctx.lineWidth = 1;
   if (mesh) {
+    // The outline is only safe to draw on the WebGL layer paired with a WebGL-drawn image *this
+    // same call* — see drawFootprintOutlineWebGL's own comment for why the two have to move
+    // together (both on WebGL, or both on Canvas2D, never split across the two canvases). A
+    // footprint whose image isn't ready yet (thumbnail still loading) has nothing on the WebGL
+    // canvas to pair with, so its outline stays on Canvas2D until the image catches up.
+    let outlineDrawnOnWebgl = false;
     if (imageReady) {
       const positions = webgl ? meshToPositions(mesh, ASTROBIN_MESH_GRID_SIZE) : null;
       if (webgl && positions) {
+        const opacity = isSelected ? 1 : 0.8;
         const texture = getOrCreateAstrobinTexture(webgl.gl, webgl.textures, f.thumbnailUrl, img);
-        drawFootprintImageWebGL(webgl, texture, positions, isSelected ? 1 : 0.8, containerW, containerH);
+        drawFootprintImageWebGL(webgl, texture, positions, opacity, containerW, containerH);
+        drawFootprintOutlineWebGL(webgl, positions, ASTROBIN_MESH_GRID_SIZE, opacity, containerW, containerH);
+        outlineDrawnOnWebgl = true;
       } else {
         // No WebGL context, or a grid point went unprojectable this one frame (see
         // meshToPositions) — Canvas2D per-triangle drawing as a fallback, seam and all, rather
@@ -1468,7 +1627,7 @@ function drawOneAstrobinFootprint(
         drawImageMesh(ctx, img, mesh, ASTROBIN_MESH_GRID_SIZE, maxSpanPx);
       }
     }
-    drawMeshOutline(ctx, mesh, ASTROBIN_MESH_GRID_SIZE);
+    if (!outlineDrawnOnWebgl) drawMeshOutline(ctx, mesh, ASTROBIN_MESH_GRID_SIZE);
   } else if (w <= maxSpanPx && h <= maxSpanPx) {
     ctx.save();
     ctx.translate(cx, cy);
@@ -1490,16 +1649,24 @@ function drawOneAstrobinFootprint(
  * couple hundred elements getting their transform/size recomputed on every pan/zoom frame; a
  * canvas redraw touches no layout at all. `footprints` is expected pre-sorted largest-first (see
  * its fetch call site) so a wide-field shot paints under any narrower one of the same target by
- * default; `selectedUrl` — whichever footprint currently has its popover open, see
+ * default; `selectedHash` — whichever footprint currently has its popover open, see
  * handleAstrobinClick — is drawn last/on top regardless of its own size, replacing the transient
  * hover-raises-z-index behavior with one that stays put until the popover actually closes.
+ * Identified by hash, not url: AstroBin sends `hash: null` for a real share of images (see
+ * safeHash's own comment server-side), which used to collide multiple footprints onto the exact
+ * same *url* too (built from that same null hash) — every one of them then matched `selectedUrl`
+ * simultaneously, and this loop's own `continue`-and-defer-to-selectedEntry logic meant only the
+ * *last* of them in draw order ever actually got drawn, silently dropping the rest of the gallery
+ * the moment any one of them was clicked. hash is already guaranteed unique server-side (falls
+ * back to the image's numeric id, never null) — matching on it instead means a future url
+ * collision of this same shape can't take out the rest of the gallery again.
  * Returns the screen-space geometry of everything drawn, for the caller's own hit-testing. */
 function drawAstrobinFootprints(
   ctx: CanvasRenderingContext2D,
   aladin: any,
   footprints: AstrobinFootprint[],
-  hiddenUrls: Set<string>,
-  selectedUrl: string | null,
+  hiddenHashes: Set<string>,
+  selectedHash: string | null,
   imagesCache: Map<string, HTMLImageElement>,
   onLoadStart: (key: string) => void,
   onSettled: (key: string) => void,
@@ -1536,7 +1703,7 @@ function drawAstrobinFootprints(
     const { ra: fRa, dec: fDec, radiusDeg: fRadiusDeg } = footprintCenterAndRadiusDeg(footprint);
     if (angularSeparationDeg(viewRa, viewDec, fRa, fDec) > viewRadiusDeg + fRadiusDeg) continue;
 
-    const hidden = hiddenUrls.has(footprint.url);
+    const hidden = hiddenHashes.has(footprint.hash);
     const rect = computeScreenRect(aladin, footprintCorners(footprint), !footprint.corners);
     if (!rect) continue;
     // world2pix returning non-null only means "this projection can map the point somewhere" — for
@@ -1558,7 +1725,7 @@ function drawAstrobinFootprints(
     const halfDiag = Math.min(Math.hypot(rect.w, rect.h), maxSpanPx) / 2;
     if (rect.cx < -halfDiag || rect.cx > containerW + halfDiag || rect.cy < -halfDiag || rect.cy > containerH + halfDiag) continue;
     rects.push({ footprint, hidden, ...rect });
-    if (footprint.url === selectedUrl && !hidden) {
+    if (footprint.hash === selectedHash && !hidden) {
       selectedEntry = { footprint, rect };
       continue;
     }
@@ -2128,6 +2295,43 @@ function drawOpenTargets(
   });
 }
 
+/** The Planning FOV rectangle — dashed + a different hue than the live Mount FOV overlay, so
+ * "planned framing" is never mistaken for "where the camera is actually pointed right now". Bails
+ * on the whole shape if any one corner fails to project rather than drawing a partial/degenerate
+ * quad — unlike the horizon circle (see strokeHorizonLoop), this is a small, local 4-point shape
+ * with no legitimate case for only part of it being off-screen while the rest projects fine. */
+function drawPlanningFovOverlay(ctx: CanvasRenderingContext2D, aladin: any, corners: [number, number][]) {
+  const points = corners.map(([ra, dec]) => safeWorld2Pix(aladin, ra, dec));
+  if (points.some((p) => !p)) return;
+  ctx.save();
+  ctx.strokeStyle = '#c084fc';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([8, 6]);
+  ctx.beginPath();
+  ctx.moveTo(points[0]![0], points[0]![1]);
+  for (let i = 1; i < points.length; i++) ctx.lineTo(points[i]![0], points[i]![1]);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+}
+
+/** The Planning FOV target's own diurnal path — every point sharing its declination, at every RA
+ * (Earth's rotation carries the target along this exact circle over the course of a day, even
+ * though its own RA/Dec never changes; what changes is which part of the circle is above the
+ * horizon — see the visibility chart for that side of it). ~120 points (3° steps) is enough for a
+ * visually smooth circle even right up against a pole, where it's tight and small. Thin/undashed
+ * so it doesn't compete visually with the FOV rectangle itself. Reuses projectLoop/strokeHorizonLoop
+ * (see drawHorizonOverlay) rather than a bespoke loop here — same "360°-sweep circle that may only
+ * be partly on screen" shape, same tolerance for individual points not projecting. */
+function drawPlanningFovPath(
+  ctx: CanvasRenderingContext2D, aladin: any, centerDecDeg: number, containerW: number, containerH: number,
+) {
+  const points: [number, number][] = [];
+  for (let ra = 0; ra <= 360; ra += 3) points.push([ra, centerDecDeg]);
+  const maxSegmentPx = Math.max(containerW, containerH) * 0.6;
+  strokeHorizonLoop(ctx, projectLoop(aladin, points), '#c084fc', maxSegmentPx, 1);
+}
+
 export function SkyMapCard({
   dataSource, mountCoords, activeJob, jobs, ekosReady, fov, pa, lastImageFilename,
   supportsOpenTargets = true,
@@ -2142,11 +2346,6 @@ export function SkyMapCard({
   const mountCatalogRef = useRef<any>(null);
   const targetCatalogRef = useRef<any>(null);
   const fovOverlayRef = useRef<any>(null);
-  const planningFovOverlayRef = useRef<any>(null);
-  // The Planning FOV target's own diurnal path (its declination circle — every point sharing its
-  // declination, at every RA) — see planningFovCenter's own comment for why this is a separate,
-  // debounced overlay rather than being folded into planningFovOverlay above.
-  const planningFovPathOverlayRef = useRef<any>(null);
   const ngcCatalogRef = useRef<any>(null);
   const sh2CatalogRef = useRef<any>(null);
   const ngcBoundaryRef = useRef<any>(null);
@@ -2197,9 +2396,11 @@ export function SkyMapCard({
     const gl = canvas.getContext('webgl');
     if (!gl) return;
     const program = createAstrobinProgram(gl);
+    const lineProgram = createAstrobinLineProgram(gl);
     const indexBuffer = gl.createBuffer()!;
     const texCoordBuffer = gl.createBuffer()!;
     const positionBuffer = gl.createBuffer()!;
+    const linePositionBuffer = gl.createBuffer()!;
 
     const indices = buildAstrobinMeshIndices(ASTROBIN_MESH_GRID_SIZE);
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
@@ -2226,6 +2427,7 @@ export function SkyMapCard({
     astrobinGlRef.current = {
       gl, program, indexBuffer, texCoordBuffer, positionBuffer,
       indexCount: indices.length, textures: astrobinTexturesRef.current,
+      lineProgram, linePositionBuffer,
     };
   }, []);
   // The flat geometric horizon + any enabled artificial-horizon regions — plain canvas drawing
@@ -2322,7 +2524,10 @@ export function SkyMapCard({
   // the same area, since they're bigger and later in z-order — "hidden" collapses one down to
   // just its outline (plus a small reveal button) so whatever's underneath becomes clickable.
   // Not persisted: it's a per-session decluttering aid, not a setting worth remembering forever.
-  const [hiddenAstrobinUrls, setHiddenAstrobinUrls] = useState<Set<string>>(new Set());
+  // Keyed by hash, not url — see drawAstrobinFootprints' own comment on selectedHash for why url
+  // isn't safe as an identity key here (AstroBin's own hash: null bug used to collapse every
+  // affected footprint onto the same url, so hiding *one* of them hid *all* of them at once).
+  const [hiddenAstrobinHashes, setHiddenAstrobinHashes] = useState<Set<string>>(new Set());
   // The footprint whose popover is currently open doubles as "selected" — see drawAstrobinFootprints
   // — so it's the only one z-ordering ever raises above the rest, replacing the old ephemeral hover
   // highlight with something that stays put until you actually close the popover. Position isn't
@@ -2360,7 +2565,7 @@ export function SkyMapCard({
   // altitude samples across 24h) are not, so both only recompute once the view has settled.
   const [planningFovCenter, setPlanningFovCenter] = useState<{ ra: number; dec: number } | null>(null);
   const planningFovCenterDebounceRef = useRef<number | undefined>(undefined);
-  // Not persisted — like hiddenAstrobinUrls, this is a per-session pin on a specific spot rather
+  // Not persisted — like hiddenAstrobinHashes, this is a per-session pin on a specific spot rather
   // than a durable preference, and a stale locked target reappearing on a future, unrelated
   // session would be more confusing than useful.
   const [planningFovLocked, setPlanningFovLocked] = useState(false);
@@ -2592,17 +2797,17 @@ export function SkyMapCard({
     setAstrobinPopover({ footprint: f, date: null, loading: true, error: false });
     dataSource.getAstrobinImageDetail(f.hash)
       .then((detail) => {
-        setAstrobinPopover((prev) => (prev?.footprint.url === f.url ? { ...prev, date: detail.date, loading: false } : prev));
+        setAstrobinPopover((prev) => (prev?.footprint.hash === f.hash ? { ...prev, date: detail.date, loading: false } : prev));
       })
       .catch(() => {
-        setAstrobinPopover((prev) => (prev?.footprint.url === f.url ? { ...prev, loading: false, error: true } : prev));
+        setAstrobinPopover((prev) => (prev?.footprint.hash === f.hash ? { ...prev, loading: false, error: true } : prev));
       });
   }
 
-  function toggleAstrobinHidden(url: string) {
-    setHiddenAstrobinUrls((prev) => {
+  function toggleAstrobinHidden(hash: string) {
+    setHiddenAstrobinHashes((prev) => {
       const next = new Set(prev);
-      if (next.has(url)) next.delete(url); else next.add(url);
+      if (next.has(hash)) next.delete(hash); else next.add(hash);
       return next;
     });
   }
@@ -2622,7 +2827,10 @@ export function SkyMapCard({
     const container = containerRef.current;
     if (!container) return;
     const rect = container.getBoundingClientRect();
-    const hit = hitTestAstrobinFootprint(e.clientX - rect.left, e.clientY - rect.top, astrobinHitRectsRef.current);
+    const hit = hitTestAstrobinFootprint(
+      e.clientX - rect.left, e.clientY - rect.top, astrobinHitRectsRef.current,
+      container.clientWidth, container.clientHeight,
+    );
     // A hit switches (or opens) the selection outright; a miss on blank sky deselects whatever
     // was selected — both resolved by a single authoritative call here rather than racing with
     // the outside-the-whole-map listener above, which only ever fires for clicks that don't reach
@@ -2696,17 +2904,8 @@ export function SkyMapCard({
       aladin.addOverlay(fovOverlay);
       fovOverlayRef.current = fovOverlay;
 
-      // Dashed + a different hue than the live FOV overlay, so "planned framing" is never
-      // mistaken for "where the camera is actually pointed right now".
-      const planningFovOverlay = window.A.graphicOverlay({ name: 'Planning FOV', color: '#c084fc', lineWidth: 2, lineDash: [8, 6] });
-      aladin.addOverlay(planningFovOverlay);
-      planningFovOverlayRef.current = planningFovOverlay;
-
-      // Thin/undashed so it doesn't compete visually with the FOV rectangle itself — see
-      // planningFovCenter's own comment for why this is updated separately (debounced).
-      const planningFovPathOverlay = window.A.graphicOverlay({ name: 'Planning FOV path', color: '#c084fc', lineWidth: 1 });
-      aladin.addOverlay(planningFovPathOverlay);
-      planningFovPathOverlayRef.current = planningFovPathOverlay;
+      // Planning FOV (rectangle + diurnal path) is drawn by hand on the targets canvas instead —
+      // see redraw()'s own comment on planningFovCorners for why.
 
       setReady(true);
     });
@@ -2789,33 +2988,43 @@ export function SkyMapCard({
       const overlay = fovOverlayRef.current;
       if (!aladin || !overlay) return;
 
-      const planningOverlay = planningFovOverlayRef.current;
-      if (planningOverlay) {
-        planningOverlay.removeAll();
-        if (planningFovEnabled) {
-          // Locked: stays wherever it was pinned (see togglePlanningFovLock) instead of following
-          // the view — panning/zooming around a locked framing to check what's nearby no longer
-          // drags the framing itself along.
-          let centerRa: number;
-          let centerDec: number;
-          if (planningFovLockedCenterRef.current) {
-            ({ ra: centerRa, dec: centerDec } = planningFovLockedCenterRef.current);
-          } else {
-            [centerRa, centerDec] = aladin.getRaDec();
-            window.clearTimeout(planningFovCenterDebounceRef.current);
-            planningFovCenterDebounceRef.current = window.setTimeout(() => {
-              setPlanningFovCenter({ ra: centerRa, dec: centerDec });
-            }, 200);
-          }
-          const corners = fovCorners(
-            centerRa,
-            centerDec,
-            planningFovWidthArcmin / 60,
-            planningFovHeightArcmin / 60,
-            planningFovRotationDeg,
-          );
-          planningOverlay.add(window.A.polygon(corners));
+      // Drawn by hand on the targets canvas below (see that block) rather than via
+      // aladin.addOverlay/window.A.polygon — Aladin's own overlay canvas (aladin-catalogCanvas)
+      // sits *underneath* the astrobin canvases in DOM order (confirmed live: inspecting the
+      // container's own children shows it inserted before sky-map-astrobin-webgl-canvas/
+      // sky-map-astrobin-canvas), so anything drawn through Aladin's native overlay API — this
+      // rectangle included — rendered behind every footprint thumbnail regardless of z-order
+      // within Aladin's own layer. Same reasoning (and same fix) as horizon/terrain/targets already
+      // being hand-drawn instead of trusted to Aladin's polygon renderer, just for a new symptom of
+      // it. planningFovCorners/planningFovCenterDec are computed here (state-management — the
+      // locked/live center choice and the debounced setPlanningFovCenter call both still belong in
+      // this exact spot) but not drawn until the targets-canvas block, which is the topmost of our
+      // own canvases.
+      let planningFovCorners: [number, number][] | null = null;
+      let planningFovCenterDec: number | null = null;
+      if (planningFovEnabled) {
+        // Locked: stays wherever it was pinned (see togglePlanningFovLock) instead of following
+        // the view — panning/zooming around a locked framing to check what's nearby no longer
+        // drags the framing itself along.
+        let centerRa: number;
+        let centerDec: number;
+        if (planningFovLockedCenterRef.current) {
+          ({ ra: centerRa, dec: centerDec } = planningFovLockedCenterRef.current);
+        } else {
+          [centerRa, centerDec] = aladin.getRaDec();
+          window.clearTimeout(planningFovCenterDebounceRef.current);
+          planningFovCenterDebounceRef.current = window.setTimeout(() => {
+            setPlanningFovCenter({ ra: centerRa, dec: centerDec });
+          }, 200);
         }
+        planningFovCorners = fovCorners(
+          centerRa,
+          centerDec,
+          planningFovWidthArcmin / 60,
+          planningFovHeightArcmin / 60,
+          planningFovRotationDeg,
+        );
+        planningFovCenterDec = centerDec;
       }
 
       const container = containerRef.current;
@@ -2905,7 +3114,7 @@ export function SkyMapCard({
           const canShowAstrobinImages = hasRevealedAstrobinImagesRef.current || pendingAstrobinKeysRef.current.size === 0;
           astrobinHitRectsRef.current = showAstrobin && astrobinFootprints
             ? drawAstrobinFootprints(
-              ctx, aladin, astrobinFootprints, hiddenAstrobinUrls, astrobinPopover?.footprint.url ?? null,
+              ctx, aladin, astrobinFootprints, hiddenAstrobinHashes, astrobinPopover?.footprint.hash ?? null,
               astrobinImagesRef.current,
               (key) => {
                 if (pendingAstrobinKeysRef.current.has(key)) return;
@@ -2933,7 +3142,7 @@ export function SkyMapCard({
         const popoverEl = astrobinPopoverRef.current;
         if (popoverEl) {
           const selectedRect = astrobinPopover
-            && astrobinHitRectsRef.current.find((r) => r.footprint.url === astrobinPopover.footprint.url);
+            && astrobinHitRectsRef.current.find((r) => r.footprint.hash === astrobinPopover.footprint.hash);
           if (selectedRect) {
             const [brx, bry] = screenRectBottomRight(selectedRect);
             popoverEl.style.display = 'block';
@@ -3043,6 +3252,10 @@ export function SkyMapCard({
         if (tgCtx) {
           tgCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
           tgCtx.clearRect(0, 0, container.clientWidth, container.clientHeight);
+          if (planningFovCorners) drawPlanningFovOverlay(tgCtx, aladin, planningFovCorners);
+          if (planningFovCenterDec !== null) {
+            drawPlanningFovPath(tgCtx, aladin, planningFovCenterDec, container.clientWidth, container.clientHeight);
+          }
           if (openTargetJobs.length > 0) drawOpenTargets(tgCtx, aladin, openTargetJobs);
         }
       }
@@ -3067,7 +3280,7 @@ export function SkyMapCard({
     redrawRef.current();
   }, [
     mountCoords?.ra, mountCoords?.dec, fov?.widthArcmin, fov?.heightArcmin, pa, showLastImage, lastImageFilename,
-    showAstrobin, astrobinFootprints, hiddenAstrobinUrls, astrobinPopover,
+    showAstrobin, astrobinFootprints, hiddenAstrobinHashes, astrobinPopover,
     planningFovEnabled, planningFovWidthArcmin, planningFovHeightArcmin, planningFovRotationDeg,
     showHorizon, showTerrain, horizonTime, effectiveObservatoryInfo, artificialHorizon, terrainImageLoaded,
     openTargetJobs,
@@ -3325,20 +3538,6 @@ export function SkyMapCard({
     }
   }, [planningFovEnabled]);
 
-  // The Planning FOV target's diurnal path — every point sharing its declination, at every RA
-  // (Earth's rotation carries the target along this exact circle over the course of a day, even
-  // though its own RA/Dec never changes; what changes is which part of the circle is above the
-  // horizon — see the visibility chart for that side of it). ~120 points (3° steps) is enough for
-  // a visually smooth circle even right up against a pole, where it's tight and small.
-  useEffect(() => {
-    const overlay = planningFovPathOverlayRef.current;
-    if (!overlay) return;
-    overlay.removeAll();
-    if (!planningFovEnabled || !planningFovCenter) return;
-    const points: [number, number][] = [];
-    for (let ra = 0; ra <= 360; ra += 3) points.push([ra, planningFovCenter.dec]);
-    overlay.add(window.A.polygon(points));
-  }, [planningFovEnabled, planningFovCenter]);
 
   useEffect(() => {
     writeStoredNumber(PLANNING_FOV_SENSOR_WIDTH_KEY, sensorWidthPx);
@@ -3922,8 +4121,8 @@ export function SkyMapCard({
             </div>
             <div className="sky-map-astrobin-popover-actions">
               <a href={astrobinPopover.footprint.url} target="_blank" rel="noreferrer">Open on AstroBin</a>
-              <button type="button" className="sky-map-button" onClick={() => toggleAstrobinHidden(astrobinPopover.footprint.url)}>
-                {hiddenAstrobinUrls.has(astrobinPopover.footprint.url) ? 'Show' : 'Hide'}
+              <button type="button" className="sky-map-button" onClick={() => toggleAstrobinHidden(astrobinPopover.footprint.hash)}>
+                {hiddenAstrobinHashes.has(astrobinPopover.footprint.hash) ? 'Show' : 'Hide'}
               </button>
             </div>
           </div>
