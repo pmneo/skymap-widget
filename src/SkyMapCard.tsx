@@ -580,6 +580,7 @@ function positionFootprintImage(img: HTMLElement, aladin: any, corners: [number,
 const FOLLOW_MOUNT_KEY = 'skymap.followMount';
 const ZENITH_LOCK_KEY = 'skymap.zenithLock';
 const PROJECTION_KEY = 'skymap.projection';
+const SURVEY_KEY = 'skymap.surveyId';
 const SHOW_LAST_IMAGE_KEY = 'skymap.showLastImage';
 const SHOW_NGC_KEY = 'skymap.showNgc';
 const SHOW_SH2_KEY = 'skymap.showSh2';
@@ -2249,7 +2250,15 @@ export function SkyMapCard({
   const lastTerrainViewKeyRef = useRef<string | null>(null);
   const horizonRetryRef = useRef<number | undefined>(undefined);
   const [ready, setReady] = useState(false);
-  const [surveyId, setSurveyId] = useState(surveys[0].id);
+  // Persisted across reloads (see SURVEY_KEY) — falls back to surveys[0] if there's nothing
+  // stored yet, or if what's stored no longer matches any of *this* deployment's own survey list
+  // (e.g. the live dashboard and the public site don't offer the same palettes, and a stale id
+  // from a previous survey list shouldn't silently resolve to whatever happens to sit at surveys[0]
+  // without at least being a deliberate fallback rather than a coincidence).
+  const [surveyId, setSurveyId] = useState(() => {
+    const stored = readStoredString(SURVEY_KEY);
+    return stored && surveys.some((s) => s.id === stored) ? stored : surveys[0].id;
+  });
   const [paletteOpen, setPaletteOpen] = useState(false);
   const paletteRef = useRef<HTMLDivElement>(null);
   // Persisted across reloads (see FOLLOW_MOUNT_KEY/SHOW_LAST_IMAGE_KEY) — both are "set once,
@@ -2709,6 +2718,10 @@ export function SkyMapCard({
     const survey = surveys.find((s) => s.id === surveyId) ?? surveys[0];
     aladinRef.current.setImageSurvey(buildImageSurvey(survey));
   }, [ready, surveyId]);
+
+  useEffect(() => {
+    writeStoredString(SURVEY_KEY, surveyId);
+  }, [surveyId]);
 
   useEffect(() => {
     if (!ready || !mountCatalogRef.current) return;
