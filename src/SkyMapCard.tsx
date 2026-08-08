@@ -320,6 +320,15 @@ function ClockIcon() {
   );
 }
 
+function EyeOffIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
+      <path d="M1 1l22 22" />
+    </svg>
+  );
+}
+
 /** Icon-only replacement for the old checkbox+label toggles — same on/off semantics, `active`
  * driven by `data-active` (styled in index.css) rather than a native checkbox appearance, since an
  * icon has no built-in checked state to show. */
@@ -872,23 +881,6 @@ function footprintAreaDeg2(f: AstrobinFootprint): number {
  * listeners off, so hit-testing has to be done by hand against this list instead. */
 interface AstrobinHitRect extends ScreenRect {
   footprint: AstrobinFootprint;
-  hidden: boolean;
-}
-
-const ASTROBIN_GEAR_MARGIN = 2;
-const ASTROBIN_GEAR_SIZE_FRACTION = 0.18;
-const ASTROBIN_GEAR_SIZE_MIN = 8;
-const ASTROBIN_GEAR_SIZE_MAX = 20;
-
-/** A fixed 20px gear button looked absurdly oversized on a footprint rendered as a tiny diamond
- * at wide FOV, and comparatively tiny on one spanning most of the canvas — this scales it with
- * the footprint's own on-screen size instead (clamped so it never gets small enough to miss on a
- * genuinely tiny footprint, or large enough to swallow one). Kept deliberately on the small side
- * even at MAX — a settings icon calling attention to itself on a footprint you can't currently see
- * anyway (that's the whole point of hiding it) is more clutter than affordance. Shared by the draw
- * and hit-test code so they can't drift apart, same reasoning as astrobinGearCenter below. */
-function astrobinGearSize(r: ScreenRect): number {
-  return clamp(Math.min(r.w, r.h) * ASTROBIN_GEAR_SIZE_FRACTION, ASTROBIN_GEAR_SIZE_MIN, ASTROBIN_GEAR_SIZE_MAX);
 }
 
 /** Point-in-rotated-rectangle test: rotate the query point into the rectangle's own local
@@ -899,38 +891,6 @@ function pointInRotatedRect(px: number, py: number, r: ScreenRect): [number, num
   const localX = dx * Math.cos(r.angleRad) + dy * Math.sin(r.angleRad);
   const localY = -dx * Math.sin(r.angleRad) + dy * Math.cos(r.angleRad);
   return [localX, localY];
-}
-
-/** The gear button's *absolute* screen position — top-right corner of the footprint's own rotated
- * frame, inset by ASTROBIN_GEAR_MARGIN (matching the old CSS `top: 2px; right: 2px`), converted out
- * of that local frame and then clamped to stay within the visible canvas. Shared by the draw and
- * hit-test code so they can't drift apart.
- *
- * Two distinct problems this guards against, both confirmed live:
- * - A footprint smaller than the gear's own (clamped) minimum size: without the local offsetX/Y
- *   floor at 0, the inset math goes negative and keeps growing as the footprint keeps shrinking,
- *   sliding the icon past the shape's own center and out its *opposite* side into empty space —
- *   this is what "scales out of the corner into nothing" looked like. Flooring at 0 instead settles
- *   the icon at the shape's own center once it's too small to inset into properly.
- * - A footprint far *larger* than the current view (e.g. a wide-field shot zoomed in close): its
- *   real corner can sit thousands of pixels outside the canvas entirely, taking the whole hidden
- *   indicator (gear included) with it — with nothing else drawn for a hidden footprint, that left
- *   no way to click it back on short of zooming back out. Clamping the *absolute* position to the
- *   canvas bounds (with a small margin) keeps it reachable regardless of how far off-screen the
- *   footprint's own corner has scrolled. */
-function astrobinGearCenter(r: ScreenRect, containerW: number, containerH: number): [number, number] {
-  const size = astrobinGearSize(r);
-  const localX = Math.max(0, r.w / 2 - ASTROBIN_GEAR_MARGIN - size / 2);
-  const localY = -Math.max(0, r.h / 2 - ASTROBIN_GEAR_MARGIN - size / 2);
-  const cos = Math.cos(r.angleRad);
-  const sin = Math.sin(r.angleRad);
-  const absoluteX = r.cx + localX * cos - localY * sin;
-  const absoluteY = r.cy + localX * sin + localY * cos;
-  const edgeMargin = size / 2 + ASTROBIN_GEAR_MARGIN;
-  return [
-    clamp(absoluteX, edgeMargin, containerW - edgeMargin),
-    clamp(absoluteY, edgeMargin, containerH - edgeMargin),
-  ];
 }
 
 /** The rect's own bottom-right corner in screen space — not just cx+w/2,cy+h/2, since the box is
@@ -954,29 +914,16 @@ function screenRectBottomRight(r: ScreenRect): [number, number] {
 }
 
 /** Iterates hit rects in reverse (later entries paint on top — see drawAstrobinFootprints) so the
- * topmost thing under the cursor wins. Hidden footprints only expose their small gear button —
- * the canvas equivalent of the old wrapper's `pointer-events: none` — so the rest of their (still
- * wide-field-sized) box doesn't shadow whatever's underneath. */
+ * topmost thing under the cursor wins. Hidden footprints are never in `rects` at all (see
+ * drawAstrobinFootprints), so there's nothing to hit-test against for them. */
 function hitTestAstrobinFootprint(
-  x: number, y: number, rects: AstrobinHitRect[], containerW: number, containerH: number,
-): { footprint: AstrobinFootprint; onGear: boolean } | null {
+  x: number, y: number, rects: AstrobinHitRect[],
+): AstrobinFootprint | null {
   for (let i = rects.length - 1; i >= 0; i--) {
     const r = rects[i];
-    if (r.hidden) {
-      // Absolute screen space, not pointInRotatedRect's local frame — astrobinGearCenter's own
-      // position is already clamped to the canvas in absolute coordinates (see its own comment for
-      // why), so comparing against a rotated-local mouse position here would silently undo that
-      // clamp for hit-testing even though the drawn icon itself stayed correctly on-screen.
-      const [gx, gy] = astrobinGearCenter(r, containerW, containerH);
-      const gearSize = astrobinGearSize(r);
-      if (Math.abs(x - gx) <= gearSize / 2 && Math.abs(y - gy) <= gearSize / 2) {
-        return { footprint: r.footprint, onGear: true };
-      }
-      continue;
-    }
     const [localX, localY] = pointInRotatedRect(x, y, r);
     if (Math.abs(localX) <= r.w / 2 && Math.abs(localY) <= r.h / 2) {
-      return { footprint: r.footprint, onGear: false };
+      return r.footprint;
     }
   }
   return null;
@@ -1037,38 +984,6 @@ function getAstrobinImage(
     .catch(settle);
 
   return img;
-}
-
-/** Redraws the gear/settings icon by hand instead of rasterizing the old SVG — same geometry (8
- * teeth around a ring, viewBox 24x24 centered at 12,12), just emitted as canvas path calls
- * directly at whatever scale the button needs, rather than loading yet another image
- * asynchronously for something this simple. */
-function drawGearButton(ctx: CanvasRenderingContext2D, gx: number, gy: number, size: number) {
-  const half = size / 2;
-  ctx.save();
-  ctx.translate(gx, gy);
-  ctx.fillStyle = 'rgba(15, 17, 26, 0.85)';
-  ctx.strokeStyle = '#22d3ee';
-  ctx.lineWidth = 1;
-  ctx.fillRect(-half, -half, size, size);
-  ctx.strokeRect(-half, -half, size, size);
-
-  const s = (size * 0.7) / 24;
-  ctx.fillStyle = '#22d3ee';
-  for (let deg = 0; deg < 360; deg += 45) {
-    ctx.save();
-    ctx.rotate((deg * Math.PI) / 180);
-    ctx.fillRect(-1.5 * s, -11.5 * s, 3 * s, 5 * s);
-    ctx.restore();
-  }
-  ctx.lineWidth = 2 * s;
-  ctx.beginPath();
-  ctx.arc(0, 0, 7 * s, 0, Math.PI * 2);
-  ctx.stroke();
-  ctx.beginPath();
-  ctx.arc(0, 0, 2.5 * s, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.restore();
 }
 
 // 4x4 (16-cell, 32-triangle) mesh per footprint — enough to make the curvature a real WCS
@@ -1520,7 +1435,6 @@ function drawOneAstrobinFootprint(
   aladin: any,
   f: AstrobinFootprint,
   rect: ScreenRect,
-  hidden: boolean,
   isSelected: boolean,
   imagesCache: Map<string, HTMLImageElement>,
   onLoadStart: (key: string) => void,
@@ -1556,14 +1470,11 @@ function drawOneAstrobinFootprint(
   // — reordering the corners array by two positions before interpolating is equivalent to that same
   // 180° correction, just expressed as a relabeling instead of an extra rotation.
   const meshCorners = f.corners ?? (([a, b, c, d]) => [c, d, a, b])(footprintCorners(f));
-  // Computed regardless of hidden/imageReady: the mesh is just the sky-curvature geometry, no
-  // image pixels involved (drawMeshOutline traces it, drawImageMesh separately textures it) —
-  // gating it on imageReady meant the outline shown while a thumbnail is still loading was a plain
+  // Computed regardless of imageReady: the mesh is just the sky-curvature geometry, no image
+  // pixels involved (drawMeshOutline traces it, drawImageMesh separately textures it) — gating it
+  // on imageReady meant the outline shown while a thumbnail is still loading was a plain
   // straight-sided rect instead of the true (slightly curved) shape, purely because texturing and
-  // outlining used to be bundled behind the same condition. Same reasoning extends to the hidden
-  // state below: it used to always fall back to a flat rotated rectangle regardless of whether a
-  // real mesh was available, so a hidden footprint's outline looked like a different (simpler)
-  // shape than the one it reveals back into on unhide.
+  // outlining used to be bundled behind the same condition.
   const rawMesh = computeFootprintMesh(aladin, meshCorners, ASTROBIN_MESH_GRID_SIZE);
   // A mesh whose points collectively sprawl across most of the canvas is just as broken as one
   // with a single oversized cell (see meshBoundingSpan's own comment) — discard the whole thing
@@ -1573,29 +1484,6 @@ function drawOneAstrobinFootprint(
   if (mesh) {
     const { spanX, spanY } = meshBoundingSpan(mesh, ASTROBIN_MESH_GRID_SIZE);
     if (spanX > maxSpanPx || spanY > maxSpanPx) mesh = null;
-  }
-
-  if (hidden) {
-    if (!mesh && (w > maxSpanPx || h > maxSpanPx)) return;
-    ctx.save();
-    ctx.strokeStyle = '#22d3ee';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([4, 3]);
-    if (mesh) {
-      drawMeshOutline(ctx, mesh, ASTROBIN_MESH_GRID_SIZE);
-    } else {
-      ctx.translate(cx, cy);
-      ctx.rotate(angleRad);
-      ctx.strokeRect(-w / 2, -h / 2, w, h);
-    }
-    ctx.restore();
-    // Absolute screen coordinates already (see astrobinGearCenter's own comment) — no
-    // translate/rotate needed here, unlike the outline above. Doesn't need one anyway: the gear's
-    // own 8-tooth glyph (see drawGearButton) is rotationally symmetric at 45° increments, so the
-    // footprint's own rotation angle would never have been visible on it regardless.
-    const [gx, gy] = astrobinGearCenter(rect, containerW, containerH);
-    drawGearButton(ctx, gx, gy, astrobinGearSize(rect));
-    return;
   }
 
   const img = getAstrobinImage(imagesCache, f, onLoadStart, onSettled);
@@ -1700,10 +1588,10 @@ function drawAstrobinFootprints(
   const viewRadiusDeg = Math.min(maxViewRadiusDeg, (Math.max(fovX, fovY) / 2) * 1.5 + 10);
 
   for (const footprint of footprints) {
+    if (hiddenHashes.has(footprint.hash)) continue;
     const { ra: fRa, dec: fDec, radiusDeg: fRadiusDeg } = footprintCenterAndRadiusDeg(footprint);
     if (angularSeparationDeg(viewRa, viewDec, fRa, fDec) > viewRadiusDeg + fRadiusDeg) continue;
 
-    const hidden = hiddenHashes.has(footprint.hash);
     const rect = computeScreenRect(aladin, footprintCorners(footprint), !footprint.corners);
     if (!rect) continue;
     // world2pix returning non-null only means "this projection can map the point somewhere" — for
@@ -1724,15 +1612,15 @@ function drawAstrobinFootprints(
     const maxSpanPx = Math.max(containerW, containerH) * 3;
     const halfDiag = Math.min(Math.hypot(rect.w, rect.h), maxSpanPx) / 2;
     if (rect.cx < -halfDiag || rect.cx > containerW + halfDiag || rect.cy < -halfDiag || rect.cy > containerH + halfDiag) continue;
-    rects.push({ footprint, hidden, ...rect });
-    if (footprint.hash === selectedHash && !hidden) {
+    rects.push({ footprint, ...rect });
+    if (footprint.hash === selectedHash) {
       selectedEntry = { footprint, rect };
       continue;
     }
-    drawOneAstrobinFootprint(ctx, aladin, footprint, rect, hidden, false, imagesCache, onLoadStart, onSettled, containerW, containerH, canShowImages, webgl);
+    drawOneAstrobinFootprint(ctx, aladin, footprint, rect, false, imagesCache, onLoadStart, onSettled, containerW, containerH, canShowImages, webgl);
   }
   if (selectedEntry) {
-    drawOneAstrobinFootprint(ctx, aladin, selectedEntry.footprint, selectedEntry.rect, false, true, imagesCache, onLoadStart, onSettled, containerW, containerH, canShowImages, webgl);
+    drawOneAstrobinFootprint(ctx, aladin, selectedEntry.footprint, selectedEntry.rect, true, imagesCache, onLoadStart, onSettled, containerW, containerH, canShowImages, webgl);
   }
   return rects;
 }
@@ -1967,9 +1855,8 @@ function drawCardinalPoints(
     const { raDeg, decDeg } = altAzToRaDec(0, azDeg, info.latitude, info.longitude, dateMs);
     const p = safeWorld2Pix(aladin, raDeg, decDeg, stats);
     if (!p) return;
-    // A small dark backing square behind the letter — same reasoning as drawGearButton's own
-    // translucent box — keeps it legible over a bright nebula/star field the plain orange text
-    // alone would wash out against.
+    // A small dark backing square behind the letter keeps it legible over a bright nebula/star
+    // field the plain orange text alone would wash out against.
     ctx.fillStyle = 'rgba(15, 17, 26, 0.75)';
     ctx.fillRect(p[0] - 9, p[1] - 9, 18, 18);
     ctx.fillStyle = '#f97316';
@@ -2267,7 +2154,7 @@ function isOpenSchedulerJob(job: SchedulerJob): boolean {
 }
 
 /** Small target/bullseye marker plus name label for each still-open scheduler job — same "dark
- * backing box behind the text" legibility trick as drawCardinalPoints/drawGearButton use. */
+ * backing box behind the text" legibility trick as drawCardinalPoints uses. */
 function drawOpenTargets(
   ctx: CanvasRenderingContext2D,
   aladin: any,
@@ -2463,6 +2350,9 @@ export function SkyMapCard({
   });
   const [paletteOpen, setPaletteOpen] = useState(false);
   const paletteRef = useRef<HTMLDivElement>(null);
+  const [hiddenListOpen, setHiddenListOpen] = useState(false);
+  const hiddenListRef = useRef<HTMLDivElement>(null);
+  const hiddenListPopupRef = useRef<HTMLDivElement>(null);
   // Persisted across reloads (see FOLLOW_MOUNT_KEY/SHOW_LAST_IMAGE_KEY) — both are "set once,
   // forget about it" toggles, so a reload silently reverting them is more surprising than useful.
   const [showLastImage, setShowLastImage] = useState(() => readStoredBoolean(SHOW_LAST_IMAGE_KEY));
@@ -2750,6 +2640,48 @@ export function SkyMapCard({
     };
   }, [paletteOpen]);
 
+  // Same outside-click/Escape pattern as the survey/palette picker above, for the hidden-footprints
+  // list popup (see its own button below).
+  useEffect(() => {
+    if (!hiddenListOpen) return undefined;
+    function onPointerDown(e: PointerEvent) {
+      if (hiddenListRef.current && !hiddenListRef.current.contains(e.target as Node)) {
+        setHiddenListOpen(false);
+      }
+    }
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') setHiddenListOpen(false);
+    }
+    document.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [hiddenListOpen]);
+
+  // Unlike the palette picker (always the toolbar's leftmost button), this button sits mid-row —
+  // its popup's default left-aligned position (same as .sky-map-palette-popup) pushed 50-80px past
+  // the right edge of the screen on a narrow phone viewport (confirmed via Playwright at
+  // 320-390px), since that's more horizontal room than the button's own on-screen position leaves
+  // to its right. A fixed CSS breakpoint can't fix this generally — how far it overflows depends on
+  // where the button lands in the wrapped toolbar row, which varies with viewport width — so this
+  // measures the actual overflow each time the popup opens and shifts it back on-screen, the same
+  // way the AstroBin footprint popover's own position is clamped against its container.
+  useEffect(() => {
+    if (!hiddenListOpen) return undefined;
+    const popup = hiddenListPopupRef.current;
+    const picker = hiddenListRef.current;
+    if (!popup || !picker) return undefined;
+    popup.style.left = '0px';
+    const pickerLeft = picker.getBoundingClientRect().left;
+    const margin = 8;
+    const minLeft = margin - pickerLeft;
+    const maxLeft = window.innerWidth - margin - popup.offsetWidth - pickerLeft;
+    popup.style.left = `${clamp(0, minLeft, maxLeft)}px`;
+    return undefined;
+  }, [hiddenListOpen, hiddenAstrobinHashes]);
+
   // Recorded on every mousedown regardless of target — a pan can start inside the sky map and end
   // outside it (or vice versa) — so both listeners below can tell a background drag-to-pan apart
   // from an actual click, which a plain 'click' listener can't do on its own (see
@@ -2829,13 +2761,12 @@ export function SkyMapCard({
     const rect = container.getBoundingClientRect();
     const hit = hitTestAstrobinFootprint(
       e.clientX - rect.left, e.clientY - rect.top, astrobinHitRectsRef.current,
-      container.clientWidth, container.clientHeight,
     );
     // A hit switches (or opens) the selection outright; a miss on blank sky deselects whatever
     // was selected — both resolved by a single authoritative call here rather than racing with
     // the outside-the-whole-map listener above, which only ever fires for clicks that don't reach
     // this handler at all.
-    if (hit) openAstrobinPopover(hit.footprint);
+    if (hit) openAstrobinPopover(hit);
     else setAstrobinPopover(null);
   }
 
@@ -3835,6 +3766,36 @@ export function SkyMapCard({
           icon={<ConstellationBoundsIcon />}
         />
         <IconToggleButton active={showAstrobin} onToggle={() => setShowAstrobin((v) => !v)} title="My AstroBin" icon={<GalleryIcon />} />
+        <div className="sky-map-hidden-list-picker" ref={hiddenListRef}>
+          <button
+            type="button"
+            className="sky-map-icon-button"
+            data-active={hiddenAstrobinHashes.size > 0 ? 'true' : undefined}
+            onClick={() => setHiddenListOpen((open) => !open)}
+            title={hiddenAstrobinHashes.size > 0 ? `Hidden images (${hiddenAstrobinHashes.size})` : 'Hidden images'}
+            aria-label="Hidden images"
+          >
+            <EyeOffIcon />
+          </button>
+          {hiddenListOpen && (
+            <div className="sky-map-hidden-list-popup" ref={hiddenListPopupRef}>
+              {hiddenAstrobinHashes.size === 0 ? (
+                <div className="sky-map-hidden-list-empty">No hidden images</div>
+              ) : (
+                (astrobinFootprints ?? [])
+                  .filter((f) => hiddenAstrobinHashes.has(f.hash))
+                  .map((f) => (
+                    <div key={f.hash} className="sky-map-hidden-list-item">
+                      <span className="sky-map-hidden-list-item-title">{f.title}</span>
+                      <button type="button" className="sky-map-hidden-list-item-show" onClick={() => toggleAstrobinHidden(f.hash)}>
+                        Show
+                      </button>
+                    </div>
+                  ))
+              )}
+            </div>
+          )}
+        </div>
         {supportsOpenTargets && (
           <IconToggleButton
             active={showOpenTargets}
@@ -4099,9 +4060,10 @@ export function SkyMapCard({
           />
         )}
         {/* The footprint images themselves — WebGL, seam-free (see drawFootprintImageWebGL). Sits
-            directly under astrobinCanvasRef, which now only draws mesh outlines, the hidden/dashed
-            state, and the gear button on top of whatever this paints (or, lacking a WebGL context,
-            its own Canvas2D drawImageMesh fallback — see AstrobinGl's own comment). */}
+            directly under astrobinCanvasRef, which now only draws mesh outlines on top of whatever
+            this paints (or, lacking a WebGL context, its own Canvas2D drawImageMesh fallback — see
+            AstrobinGl's own comment). Hidden footprints are skipped entirely by drawAstrobinFootprints
+            and never reach either canvas — see the hidden-footprints list popup for how to unhide. */}
         <canvas ref={astrobinWebglCanvasRef} className="sky-map-astrobin-webgl-canvas" />
         <canvas ref={astrobinCanvasRef} className="sky-map-astrobin-canvas" />
         <canvas ref={terrainCanvasRef} className="sky-map-terrain-canvas" />
@@ -4121,8 +4083,15 @@ export function SkyMapCard({
             </div>
             <div className="sky-map-astrobin-popover-actions">
               <a href={astrobinPopover.footprint.url} target="_blank" rel="noreferrer">Open on AstroBin</a>
-              <button type="button" className="sky-map-button" onClick={() => toggleAstrobinHidden(astrobinPopover.footprint.hash)}>
-                {hiddenAstrobinHashes.has(astrobinPopover.footprint.hash) ? 'Show' : 'Hide'}
+              <button
+                type="button"
+                className="sky-map-button"
+                onClick={() => {
+                  toggleAstrobinHidden(astrobinPopover.footprint.hash);
+                  setAstrobinPopover(null);
+                }}
+              >
+                Hide
               </button>
             </div>
           </div>

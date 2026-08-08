@@ -151,6 +151,76 @@
   color: var(--accent);
 }
 
+.sky-map-hidden-list-picker {
+  position: relative;
+  display: flex;
+}
+
+.sky-map-hidden-list-popup {
+  position: absolute;
+  top: calc(100% + 6px);
+  /* left is overwritten inline on open (see the hiddenListOpen effect) once the button's actual
+     on-screen position is known — this default only matters for the one frame before that runs. */
+  left: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 240px;
+  max-width: calc(100vw - 16px);
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.sky-map-hidden-list-empty {
+  color: var(--text-dim, #7a8194);
+  font-size: 0.8rem;
+  padding: 6px 8px;
+}
+
+.sky-map-hidden-list-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+.sky-map-hidden-list-item:hover {
+  background: #10121a;
+}
+
+.sky-map-hidden-list-item-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 0.8rem;
+}
+
+.sky-map-hidden-list-item-show {
+  flex-shrink: 0;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--accent);
+  padding: 3px 8px;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.sky-map-hidden-list-item-show:hover {
+  border-color: var(--accent);
+}
+
 .sky-map-planning-fov {
   display: flex;
   align-items: center;
